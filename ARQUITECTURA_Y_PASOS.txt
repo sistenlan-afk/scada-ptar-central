@@ -1,0 +1,28 @@
+ARQUITECTURA PROPUESTA
+======================
+
+1. PWA Android
+   - Formularios móviles.
+   - IndexedDB para guardar registros sin señal.
+   - Cola de sincronización.
+   - Identificador UUID por registro para evitar duplicados.
+
+2. API central
+   - FastAPI sobre HTTPS.
+   - Autenticación de usuarios y permisos (pendiente de implementar antes de producción).
+   - Validación de datos y bitácora de sincronización.
+   - Base de datos central. El SQLite incluido es solo para demostración; para varios usuarios
+     en producción se recomienda una base de datos de servidor como PostgreSQL.
+
+3. Windows
+   - El programa Tkinter actual debe recibir un módulo de sincronización que envíe registros
+     locales al mismo API.
+   - La integración debe hacerse usando las tablas y funciones reales del programa existente.
+   - No usar el mismo archivo SQLite compartido por carpeta de red entre varios dispositivos.
+
+4. Pruebas necesarias antes de producción
+   - Guardar cada tipo de registro sin internet.
+   - Cerrar y volver a abrir la PWA y comprobar que los registros siguen ahí.
+   - Recuperar conexión y comprobar que se sincronizan.
+   - Reintentar la sincronización y comprobar que no se duplican.
+   - Probar conflictos, usuarios, permisos, backups, HTTPS y restauración.
