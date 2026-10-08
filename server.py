@@ -4,6 +4,7 @@ import json, sqlite3
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 BASE=Path(__file__).resolve().parent
@@ -31,6 +32,15 @@ app=FastAPI(
     title='SCADA PTAR Bellavista - Servidor Central',
     version='1.0',
     lifespan=lifespan
+)
+
+# 🔥 ESTO CORRIGE EL PROBLEMA DE SINCRONIZACIÓN (Habilita CORS)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permite que cualquier dispositivo o celular se conecte
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite envíos POST y consultas GET
+    allow_headers=["*"],
 )
 
 class Payload(BaseModel):
