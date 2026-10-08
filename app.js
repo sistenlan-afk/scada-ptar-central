@@ -1,9 +1,8 @@
-const SERVER_URL = "https://onrender.com";
 const DB_NAME = "scada_ptar_bellavista_local";
 const STORE = "registros";
 const DEVICE_KEY = "scada_device_id";
-const API_SYNC = `${SERVER_URL}/api/sync`;
-const \$ = id => document.getElementById(id);
+const API_SYNC = "/api/sync";
+const $ = id => document.getElementById(id);
 let db;
 
 function uuid() {
@@ -58,7 +57,7 @@ function updateRecord(id, changes) {
   });
 }
 function setFields() {
-  const type = \$("tipo").value;
+  const type = $("tipo").value;
   let fields = [];
   if (type.startsWith("ph_")) fields = [
     ["ph", "Valor de pH", "number", "0.01"],
@@ -77,27 +76,27 @@ function setFields() {
     ["categoria", "Categoría de novedad", "text", null],
     ["prioridad", "Prioridad", "select_priority", null]
   ];
-  \$("dynamicFields").innerHTML = '<div class="field-grid">' + fields.map(([id,label,type,step]) => {
+  $("dynamicFields").innerHTML = '<div class="field-grid">' + fields.map(([id,label,type,step]) => {
     let input;
     if (type === "select") input = `<select id="f_${id}"><option>Completado</option><option>Parcial</option><option>Pendiente</option></select>`;
     else if (type === "select_priority") input = `<select id="f_${id}"><option>Baja</option><option>Media</option><option>Alta</option></select>`;
-    else input = `<input id="f_${id}" type="${type}" ${step ? `step="\${step}"` : ""} ${type==="number" ? 'required' : 'required'}>`;
+    else input = `<input id="f_${id}" type="${type}" ${step ? `step="${step}"` : ""} ${type==="number" ? 'required' : 'required'}>`;
     return `<label>${label}${input}</label>`;
   }).join("") + "</div>";
 }
 function valueFor(id) {
-  const el = \$("f_" + id);
+  const el = $("f_" + id);
   if (!el) return "";
   return el.type === "number" ? Number(el.value) : el.value.trim();
 }
 function collectData() {
-  const type = \$("tipo").value;
+  const type = $("tipo").value;
   let keys = type.startsWith("ph_") ? ["ph","temperatura_c"] :
     type === "aforo" ? ["volumen_l","tiempo_s"] :
     type === "lavado" ? ["unidad","estado","tiempo"] : ["categoria","prioridad"];
   const datos = {};
   keys.forEach(k => datos[k] = valueFor(k));
-  datos.observaciones = \$("observaciones").value.trim();
+  datos.observaciones = $("observaciones").value.trim();
   return datos;
 }
 function typeName(t) {
@@ -106,8 +105,8 @@ function typeName(t) {
 async function render() {
   const rows = await allRecords();
   const pending = rows.filter(r => r.estado_sync !== "sincronizado").length;
-  \$("counts").textContent = `${pending} pendientes · ${rows.length-pending} sincronizados`;
-  \$("records").innerHTML = rows.slice(0,100).map(r => `
+  $("counts").textContent = `${pending} pendientes · ${rows.length-pending} sincronizados`;
+  $("records").innerHTML = rows.slice(0,100).map(r => `
     <article class="record">
       <div class="record-top"><b>${typeName(r.tipo)}</b><span class="badge ${r.estado_sync==="sincronizado"?"synced":""}">${r.estado_sync==="sincronizado"?"Sincronizado":"Pendiente"}</span></div>
       <small>${r.fecha_hora.replace("T"," ")} · ${escapeHtml(r.operador)}</small>
@@ -115,28 +114,28 @@ async function render() {
     </article>`).join("") || "<p>No hay registros guardados en este dispositivo.</p>";
 }
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"'"}[c]));
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 async function checkConnection() {
-  if (!navigator.onLine) { \$("connection").textContent = "Sin conexión · modo local"; return false; }
+  if (!navigator.onLine) { $("connection").textContent = "Sin conexión · modo local"; return false; }
   try {
-    const r = await fetch(`${SERVER_URL}/api/health`, {cache:"no-store"});
+    const r = await fetch("/api/health", {cache:"no-store"});
     if (!r.ok) throw new Error();
-    \$("connection").textContent = "Conectado";
+    $("connection").textContent = "Conectado";
     return true;
   } catch {
-    \$("connection").textContent = "Sin servidor · modo local";
+    $("connection").textContent = "Sin servidor · modo local";
     return false;
   }
 }
 async function syncPending() {
   if (!(await checkConnection())) {
-    \$("syncMessage").textContent = "No hay conexión con el servidor. Los datos siguen guardados en este dispositivo.";
+    $("syncMessage").textContent = "No hay conexión con el servidor. Los datos siguen guardados en este dispositivo.";
     return;
   }
   const rows = (await allRecords()).filter(r => r.estado_sync !== "sincronizado");
-  if (!rows.length) { \$("syncMessage").textContent = "No hay registros pendientes."; return; }
-  \$("syncMessage").textContent = "Sincronizando…";
+  if (!rows.length) { $("syncMessage").textContent = "No hay registros pendientes."; return; }
+  $("syncMessage").textContent = "Sincronizando…";
   const payload = {device_id:deviceId(), registros: rows.map(r => ({
     sync_uuid:r.id, tabla:r.tipo, fecha:r.fecha_hora, operador:r.operador,
     datos:r.datos, device_id:r.dispositivo_id
@@ -149,42 +148,42 @@ async function syncPending() {
     const result = await response.json();
     const confirmed = new Set(result.confirmados || []);
     for (const row of rows) if (confirmed.has(row.id)) await updateRecord(row.id, {estado_sync:"sincronizado"});
-    \$("syncMessage").textContent = `Sincronización terminada: ${confirmed.size} registros confirmados.`;
+    $("syncMessage").textContent = `Sincronización terminada: ${confirmed.size} registros confirmados.`;
     await render();
   } catch (e) {
-    \$("syncMessage").textContent = "No se pudo sincronizar. Los registros permanecen guardados para reintentar.";
+    $("syncMessage").textContent = "No se pudo sincronizar. Los registros permanecen guardados para reintentar.";
   }
 }
-\$("tipo").addEventListener("change", setFields);
-\$("recordForm").addEventListener("submit", async event => {
+$("tipo").addEventListener("change", setFields);
+$("recordForm").addEventListener("submit", async event => {
   event.preventDefault();
   const record = {
-    id:uuid(), tipo:\(("tipo").value, fecha_hora:\)("fechaHora").value,
-    operador:\$("operador").value.trim(), datos:collectData(),
+    id:uuid(), tipo:$("tipo").value, fecha_hora:$("fechaHora").value,
+    operador:$("operador").value.trim(), datos:collectData(),
     dispositivo_id:deviceId(), estado_sync:"pendiente",
     creado_local:new Date().toISOString()
   };
   if (!record.operador) { alert("Escribe el nombre del operador."); return; }
   await putRecord(record);
-  \$("recordForm").reset();
-  \$("fechaHora").value = new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+  $("recordForm").reset();
+  $("fechaHora").value = new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
   setFields();
   await render();
-  \$("syncMessage").textContent = "Registro guardado localmente. Sincroniza cuando haya conexión.";
+  $("syncMessage").textContent = "Registro guardado localmente. Sincroniza cuando haya conexión.";
 });
-\$("syncBtn").addEventListener("click", syncPending);
-\$("refreshBtn").addEventListener("click", render);
+$("syncBtn").addEventListener("click", syncPending);
+$("refreshBtn").addEventListener("click", render);
 window.addEventListener("online", checkConnection);
 window.addEventListener("online", () => syncPending());
 (async () => {
   try {
     await openDB();
     setFields();
-    \$("fechaHora").value = new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+    $("fechaHora").value = new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
     await render();
     await checkConnection();
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(()=>{});
   } catch(e) {
-    \$("syncMessage").textContent = "No se pudo iniciar el almacenamiento local del navegador.";
+    $("syncMessage").textContent = "No se pudo iniciar el almacenamiento local del navegador.";
   }
 })();
