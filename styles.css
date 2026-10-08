@@ -1,0 +1,28 @@
+:root{font-family:Segoe UI,Arial,sans-serif;color:#17243a;background:#f2f5f9}
+*{box-sizing:border-box}
+body{margin:0}
+header{background:#12315b;color:white;padding:15px max(16px,calc((100% - 1050px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.brand{font-size:1.12rem;font-weight:700}
+.status{font-size:.88rem;background:#ffffff20;padding:7px 10px;border-radius:20px}
+main{max-width:1050px;margin:22px auto;padding:0 14px}
+.intro h1{margin-bottom:5px;font-size:1.55rem}
+.intro p{line-height:1.5;color:#526078}
+.panel{background:white;border:1px solid #d9e1ec;border-radius:13px;padding:18px;margin:16px 0;box-shadow:0 2px 8px #10294a0b}
+h2{font-size:1.15rem;margin:0 0 15px}
+label{display:flex;flex-direction:column;gap:6px;font-weight:600;font-size:.92rem;margin-bottom:13px}
+input,select,textarea{width:100%;font:inherit;padding:11px;border:1px solid #b9c6d6;border-radius:8px;background:white;color:#17243a}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+button{background:#174c89;color:white;border:0;border-radius:8px;padding:12px 15px;font:inherit;font-weight:650;cursor:pointer}
+button.secondary{background:#e8eef6;color:#19385e}
+.actions{display:flex;gap:9px;flex-wrap:wrap}
+.list-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#counts{font-size:.88rem;color:#5b687b}
+.records{display:grid;gap:9px;margin-top:12px}
+.record{border:1px solid #e0e6ee;border-radius:9px;padding:12px}
+.record-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.record small{color:#64748b}
+.badge{font-size:.78rem;padding:4px 7px;border-radius:15px;background:#fff1cc;color:#7b5300}
+.badge.synced{background:#dff5e8;color:#17633b}
+footer{text-align:center;color:#65738a;padding:15px;font-size:.85rem}
+.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:620px){main{margin:12px auto}.panel{padding:14px}.grid,.field-grid{grid-template-columns:1fr}.intro h1{font-size:1.3rem}button{width:100%}.actions{display:grid}}
