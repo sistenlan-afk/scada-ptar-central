@@ -1,0 +1,3490 @@
+# -*- coding: utf-8 -*-
+"""
+SCADA LITE - PTAR BELLAVISTA
+Consola de operación y registro diario.
+Requiere: Python 3.10+  |  Opcional: matplotlib (para las gráficas)
+"""
+
+import random
+import sqlite3
+import csv
+from pathlib import Path
+import datetime
+import webbrowser
+import urllib.parse
+import urllib.request
+import json
+import uuid
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import ttk, messagebox, filedialog
+
+# ---------------------------------------------------------------- matplotlib
+# Opcional: si no está instalado, la app sigue funcionando sin gráficas.
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    HAY_GRAFICAS = True
+except Exception:
+    HAY_GRAFICAS = False
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+    HAY_EXCEL = True
+except Exception:
+    Workbook = None
+    PatternFill = Font = Alignment = None
+    HAY_EXCEL = False
+
+try:
+    from reportlab.lib import colors as pdf_colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    HAY_PDF = True
+except Exception:
+    HAY_PDF = False
+
+
+# ============================================================== 1. PALETA UI
+COLOR_MARCA      = "#0f2d59"   # azul corporativo
+COLOR_MARCA_HOVER= "#1c4585"
+COLOR_FONDO      = "#eef1f6"   # gris claro del área de trabajo
+COLOR_PANEL      = "#ffffff"
+COLOR_TEXTO      = "#1a202c"
+COLOR_SUAVE      = "#64748b"
+COLOR_OK         = "#2f855a"
+COLOR_ALERTA     = "#c53030"
+COLOR_ACENTO     = "#2b6cb0"
+COLOR_BORDE      = "#d7dde7"
+
+FUENTE_TITULO = ("Segoe UI Semibold", 14)
+FUENTE_SUB    = ("Segoe UI", 9)
+FUENTE_BASE   = ("Segoe UI", 9)
+FUENTE_FUERTE = ("Segoe UI Semibold", 9)
+
+
+# ==================================================== 2. DATOS EN MEMORIA
+PH_MIN, PH_MAX = 6.5, 8.5
+HORAS_MANTENIMIENTO = 12000.0
+
+DIARIO_HISTORIAL = []
+CONTADOR_ALARMAS = 0
+
+for d in range(1, 15):
+    DIARIO_HISTORIAL.append({
+        "planta": "BELLAVISTA",
+        "dia": f"{d:02d}", "mes": "Septiembre", "ano": "2026",
+        "caudal": round(random.uniform(0.25, 0.38), 2),
+        "ingreso": "06:00", "salida": "14:00",
+        "coagulante": 25.0, "floculante": 40.0,
+        "horometro": 112434 + (d * 8),
+        "ph_in": round(random.uniform(6.8, 7.5), 1),
+        "ph_out": round(random.uniform(6.5, 8.2), 1),
+    })
+
+
+# ==================================================== 3. BASE DE DATOS LOCAL
+# La base queda junto al programa para que la PTAR conserve sus registros
+# aunque la aplicación se cierre. No requiere internet ni un servidor externo.
+RUTA_BASE_DATOS = Path(__file__).resolve().parent / "SCADA_PTAR_BELLAVISTA.db"
+
+
+def db_conexion():
+    conexion = sqlite3.connect(str(RUTA_BASE_DATOS), timeout=10)
+    conexion.row_factory = sqlite3.Row
+    conexion.execute("PRAGMA foreign_keys = ON")
+    return conexion
+
+
+def db_ejecutar(sql, parametros=(), commit=True):
+    with db_conexion() as con:
+        cur = con.execute(sql, parametros)
+        if commit:
+            con.commit()
+        return cur.lastrowid
+
+
+def db_consultar(sql, parametros=()):
+    with db_conexion() as con:
+        return [dict(r) for r in con.execute(sql, parametros).fetchall()]
+
+
+def inicializar_base_datos():
+    """Crea la estructura central y migra los registros demo existentes una sola vez."""
+    with db_conexion() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS ph_registros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, hora TEXT, punto TEXT NOT NULL,
+            ph REAL, temperatura REAL, operador TEXT, observaciones TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS aforos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, hora TEXT, volumen_l REAL,
+            tiempo_s REAL, caudal_lps REAL, operador TEXT, observaciones TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS dosificaciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, hora TEXT, tanque TEXT,
+            producto TEXT, nivel_inicial_cm REAL, nivel_final_cm REAL,
+            consumo_l REAL, operador TEXT, observaciones TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS mantenimientos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, equipo TEXT, tipo TEXT, prioridad TEXT,
+            descripcion TEXT, responsable TEXT, horometro REAL,
+            repuestos TEXT, tiempo_horas REAL, proximo TEXT, estado TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS lavados_unidades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, unidad TEXT NOT NULL, estado TEXT,
+            tiempo TEXT, operador TEXT, notas TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS novedades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, hora TEXT, tipo TEXT, descripcion TEXT,
+            enviado_a TEXT, estado TEXT, operador TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS horometros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, hora TEXT, equipo TEXT,
+            lectura_h REAL, operador TEXT, observaciones TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS actividades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT NOT NULL, actividad TEXT, estado TEXT,
+            responsable TEXT, observaciones TEXT,
+            creado_en TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS configuracion (
+            clave TEXT PRIMARY KEY,
+            valor TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ph_fecha ON ph_registros(fecha);
+        CREATE INDEX IF NOT EXISTS idx_aforo_fecha ON aforos(fecha);
+        CREATE INDEX IF NOT EXISTS idx_lavado_fecha ON lavados_unidades(fecha);
+        CREATE INDEX IF NOT EXISTS idx_mant_fecha ON mantenimientos(fecha);
+        CREATE INDEX IF NOT EXISTS idx_novedad_fecha ON novedades(fecha);
+        """)
+        # Migración inicial: solo si la tabla está vacía.
+        if con.execute("SELECT COUNT(*) FROM ph_registros").fetchone()[0] == 0:
+            for r in DIARIO_HISTORIAL:
+                fecha = f"{r['ano']}-{MESES_NUM.get(r['mes'], '09')}-{int(r['dia']):02d}"
+                con.execute("INSERT INTO ph_registros(fecha,hora,punto,ph,temperatura,operador,observaciones) VALUES(?,?,?,?,?,?,?)",
+                            (fecha, r.get('ingreso',''), 'Entrada', r.get('ph_in'), None, OPERADOR_ACTUAL if 'OPERADOR_ACTUAL' in globals() else 'Operador de turno', 'Migrado desde el historial inicial'))
+                con.execute("INSERT INTO ph_registros(fecha,hora,punto,ph,temperatura,operador,observaciones) VALUES(?,?,?,?,?,?,?)",
+                            (fecha, r.get('salida',''), 'Salida', r.get('ph_out'), None, OPERADOR_ACTUAL if 'OPERADOR_ACTUAL' in globals() else 'Operador de turno', 'Migrado desde el historial inicial'))
+        if con.execute("SELECT COUNT(*) FROM aforos").fetchone()[0] == 0:
+            for r in DIARIO_HISTORIAL:
+                fecha = f"{r['ano']}-{MESES_NUM.get(r['mes'], '09')}-{int(r['dia']):02d}"
+                con.execute("INSERT INTO aforos(fecha,hora,volumen_l,tiempo_s,caudal_lps,operador,observaciones) VALUES(?,?,?,?,?,?,?)",
+                            (fecha, r.get('ingreso',''), 8.0, round(8.0/max(float(r.get('caudal',0.01)),0.01),2), r.get('caudal'), 'Operador de turno', 'Migrado desde el historial inicial'))
+        if con.execute("SELECT COUNT(*) FROM mantenimientos").fetchone()[0] == 0 and 'MANTENIMIENTOS_HISTORIAL' in globals():
+            for m in MANTENIMIENTOS_HISTORIAL:
+                con.execute("INSERT INTO mantenimientos(id,fecha,equipo,tipo,prioridad,descripcion,responsable,horometro,repuestos,tiempo_horas,proximo,estado) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (m['id'],m['fecha'],m['equipo'],m['tipo'],m['prioridad'],m['descripcion'],m['responsable'],m['horometro'],m['repuestos'],m['tiempo_horas'],m['proximo'],m['estado']))
+        if con.execute("SELECT COUNT(*) FROM novedades").fetchone()[0] == 0 and 'NOVEDADES_HISTORIAL' in globals():
+            for n in NOVEDADES_HISTORIAL:
+                con.execute("INSERT INTO novedades(id,fecha,hora,tipo,descripcion,enviado_a,estado,operador) VALUES(?,?,?,?,?,?,?,?)",
+                            (n['id'],n['fecha'],n['hora'],n['tipo'],n['descripcion'],n['enviado_a'],n['estado'],n['operador']))
+        if con.execute("SELECT COUNT(*) FROM lavados_unidades").fetchone()[0] == 0 and 'LAVADOS_HISTORIAL' in globals():
+            for r in LAVADOS_HISTORIAL:
+                con.execute("INSERT INTO lavados_unidades(fecha,unidad,estado,tiempo,operador,notas) VALUES(?,?,?,?,?,?)",
+                            (r['fecha'],r['unidad'],r['estado'],r['tiempo'],r['operador'],r['notas']))
+        if con.execute("SELECT COUNT(*) FROM horometros").fetchone()[0] == 0:
+            for r in DIARIO_HISTORIAL:
+                fecha = f"{r['ano']}-{MESES_NUM.get(r['mes'], '09')}-{int(r['dia']):02d}"
+                con.execute("INSERT INTO horometros(fecha,hora,equipo,lectura_h,operador,observaciones) VALUES(?,?,?,?,?,?)",
+                            (fecha, r.get('salida',''), 'Bomba', r.get('horometro'), 'Operador de turno', 'Migrado desde el historial inicial'))
+        # Normalizar fechas antiguas de lavado a ISO (AAAA-MM-DD), que es el
+        # formato utilizado por los filtros de las planillas mensuales.
+        for fila in con.execute("SELECT id, fecha FROM lavados_unidades").fetchall():
+            fecha_actual = str(fila["fecha"] or "").strip()
+            try:
+                fecha_iso = datetime.datetime.strptime(fecha_actual, "%d/%m/%Y").strftime("%Y-%m-%d")
+            except ValueError:
+                try:
+                    fecha_iso = datetime.datetime.strptime(fecha_actual, "%Y-%m-%d").strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+            if fecha_iso != fecha_actual:
+                con.execute("UPDATE lavados_unidades SET fecha=? WHERE id=?", (fecha_iso, fila["id"]))
+        con.commit()
+
+
+
+# ==================================================== SINCRONIZACIÓN OFFLINE / ONLINE
+TABLAS_SINCRONIZABLES = [
+    "ph_registros", "aforos", "dosificaciones", "mantenimientos",
+    "lavados_unidades", "novedades", "horometros", "actividades"
+]
+
+
+def obtener_config(clave, defecto=""):
+    try:
+        filas = db_consultar("SELECT valor FROM configuracion WHERE clave=?", (clave,))
+        return filas[0]["valor"] if filas else defecto
+    except Exception:
+        return defecto
+
+
+def guardar_config(clave, valor):
+    db_ejecutar("INSERT INTO configuracion(clave,valor) VALUES(?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor", (clave, str(valor)))
+
+
+def _agregar_columnas_sync():
+    """Migra la base existente sin borrar datos y asigna UUID único a cada fila."""
+    with db_conexion() as con:
+        for tabla in TABLAS_SINCRONIZABLES:
+            columnas = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})").fetchall()}
+            if "sync_uuid" not in columnas:
+                con.execute(f"ALTER TABLE {tabla} ADD COLUMN sync_uuid TEXT")
+            if "sync_estado" not in columnas:
+                con.execute(f"ALTER TABLE {tabla} ADD COLUMN sync_estado TEXT DEFAULT 'pendiente'")
+            filas = con.execute(f"SELECT id FROM {tabla} WHERE sync_uuid IS NULL OR TRIM(sync_uuid)='' ").fetchall()
+            for fila in filas:
+                con.execute(f"UPDATE {tabla} SET sync_uuid=?, sync_estado='pendiente' WHERE id=?", (str(uuid.uuid4()), fila[0]))
+            con.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{tabla}_sync_uuid ON {tabla}(sync_uuid)")
+        con.commit()
+
+
+def preparar_sincronizacion():
+    try:
+        _agregar_columnas_sync()
+    except Exception as exc:
+        print("Aviso: no se pudo preparar sincronización:", exc)
+
+
+def _marcar_sync(tabla, uuids, estado="sincronizado"):
+    if not uuids:
+        return
+    with db_conexion() as con:
+        for uid in uuids:
+            con.execute(f"UPDATE {tabla} SET sync_estado=? WHERE sync_uuid=?", (estado, uid))
+        con.commit()
+
+
+def obtener_pendientes_sync():
+    pendientes = []
+    for tabla in TABLAS_SINCRONIZABLES:
+        filas = db_consultar(f"SELECT * FROM {tabla} WHERE COALESCE(sync_estado,'pendiente') <> 'sincronizado' ORDER BY id")
+        for fila in filas:
+            fila = dict(fila)
+            uid = fila.pop("sync_uuid", None)
+            fila.pop("sync_estado", None)
+            pendientes.append({
+                "sync_uuid": uid,
+                "tabla": tabla,
+                "device_id": obtener_config("device_id", "windows-bellavista"),
+                "operador": fila.get("operador") or OPERADOR_ACTUAL,
+                "datos": fila,
+            })
+    return pendientes
+
+
+def sincronizar_con_servidor(url=None, timeout=8):
+    base = (url or obtener_config("sync_server_url", "http://127.0.0.1:8000")).strip().rstrip("/")
+    guardar_config("sync_server_url", base)
+    preparar_sincronizacion()
+    pendientes = obtener_pendientes_sync()
+    if not pendientes:
+        return {"ok": True, "mensaje": "No hay registros pendientes.", "confirmados": []}
+    payload = json.dumps({
+        "device_id": obtener_config("device_id", "windows-bellavista"),
+        "registros": pendientes,
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(base + "/api/sync", data=payload,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        resultado = json.loads(resp.read().decode("utf-8"))
+    confirmados = resultado.get("confirmados", [])
+    por_tabla = {}
+    for item in pendientes:
+        if item.get("sync_uuid") in confirmados:
+            por_tabla.setdefault(item["tabla"], []).append(item["sync_uuid"])
+    for tabla, uuids in por_tabla.items():
+        _marcar_sync(tabla, uuids)
+    return resultado
+
+
+def contar_pendientes_sync():
+    try:
+        preparar_sincronizacion()
+        return sum(len(db_consultar(f"SELECT id FROM {tabla} WHERE COALESCE(sync_estado,'pendiente') <> 'sincronizado'")) for tabla in TABLAS_SINCRONIZABLES)
+    except Exception:
+        return 0
+
+
+def abrir_sincronizacion():
+    limpiar_contenido()
+    area = _contenedor_desplazable(frame_contenido)
+    tk.Label(area, text="Sincronización", font=FUENTE_TITULO, bg=COLOR_FONDO, fg=COLOR_TEXTO).pack(anchor="w", padx=22, pady=(20,4))
+    tk.Label(area, text="El SCADA trabaja primero de forma local. Cuando haya internet, envía los registros pendientes al servidor.", font=FUENTE_SUB, bg=COLOR_FONDO, fg=COLOR_TEXTO_SEC).pack(anchor="w", padx=22, pady=(0,18))
+
+    card = tk.Frame(area, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    card.pack(fill="x", padx=22, pady=6)
+    tk.Label(card, text="Servidor de sincronización", font=FUENTE_FUERTE, bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w", padx=16, pady=(14,4))
+    e_url = ttk.Entry(card, width=70)
+    e_url.pack(fill="x", padx=16, pady=(0,12))
+    e_url.insert(0, obtener_config("sync_server_url", "https://scada-ptar-central.onrender.com"))
+
+    estado_var = tk.StringVar(value="Preparando sincronización...")
+    lbl = tk.Label(card, textvariable=estado_var, font=FUENTE_SUB, bg=COLOR_PANEL, fg=COLOR_TEXTO_SEC)
+    lbl.pack(anchor="w", padx=16, pady=(0,12))
+    pendiente_var = tk.StringVar(value="")
+    tk.Label(card, textvariable=pendiente_var, font=FUENTE_FUERTE, bg=COLOR_PANEL, fg=COLOR_MARCA).pack(anchor="w", padx=16, pady=(0,12))
+
+    def actualizar():
+        n = contar_pendientes_sync()
+        pendiente_var.set(f"Registros pendientes: {n}")
+        estado_var.set("Listo para sincronizar." if n else "Todo está sincronizado.")
+
+    def probar():
+        url = e_url.get().strip().rstrip("/")
+        guardar_config("sync_server_url", url)
+        try:
+            req = urllib.request.Request(url + "/api/health", method="GET")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                datos = json.loads(resp.read().decode("utf-8"))
+            estado_var.set("Conexión correcta con el servidor.")
+            messagebox.showinfo("Conexión", f"Servidor disponible.\nEstado: {datos.get('status','OK')}")
+        except Exception as exc:
+            estado_var.set("Sin conexión. Los datos seguirán guardándose localmente.")
+            messagebox.showwarning("Sin conexión", f"No se pudo conectar ahora.\n\n{exc}\n\nEl SCADA seguirá funcionando offline.")
+
+    def sincronizar():
+        url = e_url.get().strip().rstrip("/")
+        guardar_config("sync_server_url", url)
+        try:
+            estado_var.set("Sincronizando...")
+            ventana.update_idletasks()
+            r = sincronizar_con_servidor(url)
+            conf = len(r.get("confirmados", []))
+            estado_var.set(f"Sincronización finalizada. {conf} registros confirmados.")
+            actualizar()
+            messagebox.showinfo("Sincronización", f"Proceso terminado.\nRegistros confirmados: {conf}")
+        except Exception as exc:
+            estado_var.set("No fue posible sincronizar. Los registros permanecen en este equipo.")
+            messagebox.showwarning("Sin sincronizar", f"No se enviaron los registros.\n\n{exc}\n\nTus datos locales no se borraron.")
+
+    fb = tk.Frame(card, bg=COLOR_PANEL); fb.pack(fill="x", padx=16, pady=(0,16))
+    boton_accion(fb, "Probar conexión", probar, side="left", padx=(0,8))
+    boton_accion(fb, "Sincronizar pendientes", sincronizar, side="left", padx=(0,8))
+    boton_accion(fb, "Actualizar", actualizar, side="left")
+    actualizar()
+
+def cargar_mantenimientos_bd():
+    return db_consultar(
+        "SELECT id, fecha, equipo, tipo, prioridad, descripcion, responsable, horometro, repuestos, tiempo_horas, proximo, estado "
+        "FROM mantenimientos ORDER BY id DESC"
+    )
+
+
+def cargar_novedades_bd():
+    return db_consultar(
+        "SELECT id, fecha, hora, tipo, descripcion, enviado_a, estado, operador "
+        "FROM novedades ORDER BY id DESC"
+    )
+
+
+def cargar_horometros_bd():
+    return db_consultar(
+        "SELECT id, fecha, hora, equipo, lectura_h, operador, observaciones "
+        "FROM horometros ORDER BY id DESC"
+    )
+
+
+def cargar_dosificaciones_bd():
+    return db_consultar(
+        "SELECT id, fecha, hora, tanque, producto, nivel_inicial_cm, nivel_final_cm, consumo_l, operador, observaciones "
+        "FROM dosificaciones ORDER BY id DESC"
+    )
+
+
+def _iso_desde_ddmmaaaa(texto):
+    try:
+        return datetime.datetime.strptime(texto.strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def _fecha_para_mostrar(texto):
+    """Convierte fechas ISO de SQLite a DD/MM/AAAA para la interfaz."""
+    try:
+        return datetime.datetime.strptime(str(texto).strip(), "%Y-%m-%d").strftime("%d/%m/%Y")
+    except (ValueError, TypeError):
+        return str(texto or "")
+
+
+def resumen_bd(fecha_desde=None, fecha_hasta=None):
+    """Devuelve un resumen común para Dashboard, Analítica y Reportes."""
+    fi = fecha_desde or "1900-01-01"
+    ff = fecha_hasta or "2999-12-31"
+    ph = db_consultar("SELECT punto, AVG(ph) promedio, MIN(ph) minimo, MAX(ph) maximo, COUNT(*) registros FROM ph_registros WHERE fecha BETWEEN ? AND ? GROUP BY punto", (fi, ff))
+    af = db_consultar("SELECT AVG(caudal_lps) promedio, MIN(caudal_lps) minimo, MAX(caudal_lps) maximo, COUNT(*) registros FROM aforos WHERE fecha BETWEEN ? AND ?", (fi, ff))
+    la = db_consultar("SELECT COUNT(*) total, SUM(CASE WHEN estado='Completado' THEN 1 ELSE 0 END) completados, SUM(CASE WHEN estado='Pendiente' THEN 1 ELSE 0 END) pendientes FROM lavados_unidades WHERE fecha BETWEEN ? AND ?", (fi, ff))[0]
+    ma = db_consultar("SELECT COUNT(*) total, SUM(CASE WHEN estado NOT IN ('Realizado','Completado') THEN 1 ELSE 0 END) pendientes FROM mantenimientos WHERE fecha BETWEEN ? AND ?", (fi, ff))[0]
+    no = db_consultar("SELECT COUNT(*) total FROM novedades WHERE fecha BETWEEN ? AND ?", (fi, ff))[0]
+    return {"ph": ph, "aforos": af[0] if af else {}, "lavados": la, "mantenimientos": ma, "novedades": no}
+
+
+def guardar_ph_bd(fecha, hora, punto, ph, temperatura=None, operador="", observaciones=""):
+    return db_ejecutar("INSERT INTO ph_registros(fecha,hora,punto,ph,temperatura,operador,observaciones) VALUES(?,?,?,?,?,?,?)", (fecha,hora,punto,ph,temperatura,operador,observaciones))
+
+
+def guardar_aforo_bd(fecha, hora, volumen_l, tiempo_s, caudal_lps, operador="", observaciones=""):
+    return db_ejecutar("INSERT INTO aforos(fecha,hora,volumen_l,tiempo_s,caudal_lps,operador,observaciones) VALUES(?,?,?,?,?,?,?)", (fecha,hora,volumen_l,tiempo_s,caudal_lps,operador,observaciones))
+
+
+def guardar_mantenimiento_bd(m):
+    return db_ejecutar("INSERT INTO mantenimientos(fecha,equipo,tipo,prioridad,descripcion,responsable,horometro,repuestos,tiempo_horas,proximo,estado) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (m['fecha'],m['equipo'],m['tipo'],m['prioridad'],m['descripcion'],m['responsable'],m['horometro'],m['repuestos'],m['tiempo_horas'],m['proximo'],m['estado']))
+
+
+def guardar_novedad_bd(n):
+    return db_ejecutar("INSERT INTO novedades(fecha,hora,tipo,descripcion,enviado_a,estado,operador) VALUES(?,?,?,?,?,?,?)", (n['fecha'],n['hora'],n['tipo'],n['descripcion'],n['enviado_a'],n['estado'],n['operador']))
+
+
+def guardar_horometro_bd(fecha, hora, equipo, lectura_h, operador, observaciones=""):
+    return db_ejecutar("INSERT INTO horometros(fecha,hora,equipo,lectura_h,operador,observaciones) VALUES(?,?,?,?,?,?)", (fecha,hora,equipo,lectura_h,operador,observaciones))
+
+
+def guardar_dosificacion_bd(fecha, hora, tanque, producto, nivel_inicial, nivel_final, consumo, operador, observaciones=""):
+    return db_ejecutar("INSERT INTO dosificaciones(fecha,hora,tanque,producto,nivel_inicial_cm,nivel_final_cm,consumo_l,operador,observaciones) VALUES(?,?,?,?,?,?,?,?,?)", (fecha,hora,tanque,producto,nivel_inicial,nivel_final,consumo,operador,observaciones))
+
+
+def guardar_lavado_bd(registro):
+    return db_ejecutar(
+        "INSERT INTO lavados_unidades(fecha,unidad,estado,tiempo,operador,notas) VALUES(?,?,?,?,?,?)",
+        (registro['fecha'], registro['unidad'], registro['estado'], registro['tiempo'], registro['operador'], registro['notas'])
+    )
+
+
+def actualizar_lavado_bd(registro_id, registro):
+    db_ejecutar(
+        "UPDATE lavados_unidades SET fecha=?, unidad=?, estado=?, tiempo=?, operador=?, notas=? WHERE id=?",
+        (registro['fecha'], registro['unidad'], registro['estado'], registro['tiempo'], registro['operador'], registro['notas'], registro_id)
+    )
+
+
+def eliminar_lavado_bd(registro_id):
+    db_ejecutar("DELETE FROM lavados_unidades WHERE id=?", (registro_id,))
+
+
+def cargar_lavados_bd():
+    return db_consultar("SELECT id, fecha, unidad, estado, tiempo, operador, notas FROM lavados_unidades ORDER BY id DESC")
+
+
+# ==================================================== 3. UTILIDADES DE UI
+def limpiar():
+    for w in frame_contenido.winfo_children():
+        w.destroy()
+
+
+def _contenedor_desplazable(padre):
+    """Crea un área con scroll vertical automático (aparece solo si hace falta)
+    y devuelve el frame donde se debe empacar el contenido del módulo."""
+    lienzo = tk.Canvas(padre, bg=COLOR_FONDO, highlightthickness=0, bd=0)
+    barra = ttk.Scrollbar(padre, orient="vertical", command=lienzo.yview)
+    lienzo.configure(yscrollcommand=barra.set)
+    lienzo.pack(side="left", fill="both", expand=True)
+
+    interior = tk.Frame(lienzo, bg=COLOR_FONDO)
+    id_ventana = lienzo.create_window((0, 0), window=interior, anchor="nw")
+
+    def _ajustar_scroll(_evento=None):
+        lienzo.configure(scrollregion=lienzo.bbox("all"))
+        visible = interior.winfo_reqheight() > lienzo.winfo_height()
+        if visible and not barra.winfo_ismapped():
+            barra.pack(side="right", fill="y")
+        elif not visible and barra.winfo_ismapped():
+            barra.pack_forget()
+
+    def _ajustar_ancho(evento):
+        lienzo.itemconfig(id_ventana, width=evento.width)
+        _ajustar_scroll()
+
+    interior.bind("<Configure>", _ajustar_scroll)
+    lienzo.bind("<Configure>", _ajustar_ancho)
+
+    def _rueda(evento):
+        lienzo.yview_scroll(-1 if evento.delta > 0 else 1, "units")
+
+    lienzo.bind("<Enter>", lambda e: lienzo.bind_all("<MouseWheel>", _rueda))
+    lienzo.bind("<Leave>", lambda e: lienzo.unbind_all("<MouseWheel>"))
+
+    return interior
+
+
+def actualizar_alarmas():
+    if CONTADOR_ALARMAS > 0:
+        lbl_alarma.config(text=f"  ALARMAS ACTIVAS: {CONTADOR_ALARMAS}  ",
+                          bg=COLOR_ALERTA, fg="white")
+    else:
+        lbl_alarma.config(text="  SISTEMA ESTABLE  ", bg=COLOR_OK, fg="white")
+
+
+def estado(msg):
+    lbl_estado.config(text=msg)
+
+
+def panel(titulo, subtitulo=""):
+    """Crea la tarjeta blanca estándar de cada módulo dentro de un área con scroll."""
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="both", expand=True, padx=18, pady=14)
+
+    tk.Label(cont, text=titulo, font=FUENTE_TITULO,
+             bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    if subtitulo:
+        tk.Label(cont, text=subtitulo, font=FUENTE_SUB,
+                 bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(2, 0))
+
+    tarjeta = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE,
+                       highlightthickness=1)
+    tarjeta.pack(fill="x", pady=(10, 0))
+
+    cuerpo = tk.Frame(tarjeta, bg=COLOR_PANEL)
+    cuerpo.pack(fill="both", expand=True, padx=16, pady=14)
+    return cuerpo
+
+
+def campo(padre, etiqueta, valor="", ancho=22):
+    """Etiqueta + Entry apilados. Devuelve el Entry."""
+    tk.Label(padre, text=etiqueta, font=FUENTE_SUB,
+             bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(anchor="w", pady=(8, 2))
+    e = ttk.Entry(padre, width=ancho, font=FUENTE_BASE)
+    e.pack(anchor="w")
+    e.insert(0, valor)
+    return e
+
+
+def boton_accion(padre, texto, comando, color=COLOR_MARCA, **pack_kw):
+    b = tk.Button(padre, text=texto, command=comando, bg=color, fg="white",
+                  font=FUENTE_FUERTE, relief="flat", cursor="hand2",
+                  activebackground=COLOR_MARCA_HOVER, activeforeground="white",
+                  padx=18, pady=8, bd=0)
+    b.pack(**pack_kw)
+    b.bind("<Enter>", lambda e: b.config(bg=COLOR_MARCA_HOVER))
+    b.bind("<Leave>", lambda e: b.config(bg=color))
+    return b
+
+
+def a_float(entry, nombre):
+    """Convierte con mensaje de error claro en vez de un except mudo."""
+    texto = entry.get().strip().replace(",", ".")
+    try:
+        return float(texto)
+    except ValueError:
+        raise ValueError(f"El campo «{nombre}» debe ser un número. Recibí: '{texto}'")
+
+
+MESES_ES = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+            7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
+MESES_NUM = {nombre: f"{num:02d}" for num, nombre in MESES_ES.items()}
+
+
+def _parse_fecha_ddmmaaaa(texto):
+    """'23/09/2026' -> ('23','Septiembre','2026')  (None si el texto no es válido)"""
+    try:
+        f = datetime.datetime.strptime(texto.strip(), "%d/%m/%Y")
+        return f.strftime("%d"), MESES_ES[f.month], f.strftime("%Y")
+    except (ValueError, AttributeError, KeyError):
+        return None
+
+
+def _parse_hora_hhmm(texto):
+    try:
+        datetime.datetime.strptime(texto.strip(), "%H:%M")
+        return texto.strip()
+    except (ValueError, AttributeError):
+        return None
+
+
+def _fecha_visible_registro(r):
+    """Fecha DD/MM/AAAA de un registro de DIARIO_HISTORIAL, exista o no la clave 'fecha'."""
+    if r.get("fecha"):
+        return r["fecha"]
+    mes_num = MESES_NUM.get(r.get("mes", ""), "01")
+    return f"{r.get('dia', '01')}/{mes_num}/{r.get('ano', '2026')}"
+
+
+# ==================================================== 4. MÓDULOS
+def abrir_inicio():
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="x", padx=14, pady=10)
+
+    tk.Label(cont, text="Dashboard", font=("Segoe UI Semibold", 11), bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    tk.Label(cont, text="Vista general en tiempo real de PTAR Bellavista", font=("Segoe UI", 8),
+             bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(1, 8))
+
+    tarjeta = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    tarjeta.pack(fill="both", expand=True)
+    cuerpo = tk.Frame(tarjeta, bg=COLOR_PANEL)
+    cuerpo.pack(fill="x", padx=10, pady=8)
+
+    ultimo = DIARIO_HISTORIAL[-1]
+    anterior = DIARIO_HISTORIAL[-2] if len(DIARIO_HISTORIAL) > 1 else ultimo
+    delta_caudal = ultimo["caudal"] - anterior["caudal"]
+
+    dentro_entrada = PH_MIN <= ultimo["ph_in"] <= PH_MAX
+    dentro_salida = PH_MIN <= ultimo["ph_out"] <= PH_MAX
+
+    dias_con_registro = [d for d in DIARIO_HISTORIAL if PH_MIN <= d["ph_out"] <= PH_MAX]
+    cumplimiento_pct = round(100 * len(dias_con_registro) / len(DIARIO_HISTORIAL)) if DIARIO_HISTORIAL else 0
+
+    consumo_quimico_hoy = round(ultimo["coagulante"] + ultimo["floculante"] / 1000, 2)
+
+    # ---------------------------------------------------------- KPIs
+    tarjetas = [
+        ("Caudal actual", f"{ultimo['caudal']:.2f} L/s",
+         f"{'↑' if delta_caudal >= 0 else '↓'} {abs(delta_caudal):.2f} L/s vs ayer",
+         COLOR_ACENTO, abrir_ph_entrada),
+        ("pH entrada", f"{ultimo['ph_in']:.1f}",
+         "✔ Dentro de norma" if dentro_entrada else "⚠ Fuera de norma",
+         COLOR_OK if dentro_entrada else COLOR_ALERTA, abrir_ph_entrada),
+        ("pH salida", f"{ultimo['ph_out']:.1f}",
+         "✔ Dentro de norma" if dentro_salida else "⚠ Fuera de norma",
+         COLOR_OK if dentro_salida else COLOR_ALERTA, abrir_ph_salida),
+        ("Horómetro", f"{ultimo['horometro']:,} h",
+         f"Mantenimiento cada {HORAS_MANTENIMIENTO:.0f} h", COLOR_MARCA, abrir_horometro),
+        ("Cumplimiento pH", f"{cumplimiento_pct}%",
+         f"{len(dias_con_registro)}/{len(DIARIO_HISTORIAL)} días en rango",
+         COLOR_OK if cumplimiento_pct >= 80 else COLOR_ALERTA, abrir_estadisticas),
+        ("Consumo químico", f"{consumo_quimico_hoy:.1f} kg/d",
+         "Coagulante + floculante de hoy", COLOR_SUAVE, abrir_dosificacion),
+    ]
+
+    fila = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    fila.pack(fill="x")
+    for titulo, valor, sub, color, accion_destino in tarjetas:
+        c = tk.Frame(fila, bg="#f7f9fc", highlightbackground=COLOR_BORDE,
+                     highlightthickness=1, cursor="hand2")
+        c.pack(side="left", padx=(0, 6), pady=2, ipadx=6, ipady=4, fill="x", expand=True)
+        lbl_t = tk.Label(c, text=titulo.upper(), font=("Segoe UI", 6, "bold"),
+                         bg="#f7f9fc", fg=COLOR_SUAVE, cursor="hand2")
+        lbl_t.pack(anchor="w", padx=6)
+        lbl_v = tk.Label(c, text=valor, font=("Segoe UI Semibold", 10),
+                         bg="#f7f9fc", fg=color, cursor="hand2")
+        lbl_v.pack(anchor="w", padx=6)
+        lbl_s = tk.Label(c, text=sub, font=("Segoe UI", 6),
+                         bg="#f7f9fc", fg=COLOR_SUAVE, cursor="hand2")
+        lbl_s.pack(anchor="w", padx=6, pady=(1, 0))
+
+        def ir(_evento=None, ac=accion_destino):
+            boton = MENU_BOTON.get(ac)
+            if boton is not None:
+                seleccionar(boton, ac)
+            else:
+                ac()
+
+        for widget in (c, lbl_t, lbl_v, lbl_s):
+            widget.bind("<Button-1>", ir)
+            widget.bind("<Enter>", lambda e, cc=c: cc.config(bg="#eef4ff"))
+            widget.bind("<Leave>", lambda e, cc=c: cc.config(bg="#f7f9fc"))
+
+    # ---------------------------------------------------------- GRÁFICAS
+    fila_graficas = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    fila_graficas.pack(fill="both", expand=True, pady=(8, 0))
+
+    if HAY_GRAFICAS:
+        datos_14 = DIARIO_HISTORIAL[-14:]
+
+        marco_g1 = tk.Frame(fila_graficas, bg=COLOR_PANEL)
+        marco_g1.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(marco_g1, text="Comparativa pH entrada vs salida",
+                font=("Segoe UI Semibold", 8), bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+        fig1 = Figure(figsize=(4.3, 1.45), dpi=100, facecolor=COLOR_PANEL)
+        ax1 = fig1.add_subplot(111)
+        ax1.plot([d["dia"] for d in datos_14], [d["ph_in"] for d in datos_14],
+                 marker="o", color=COLOR_ACENTO, linewidth=1.6, markersize=2.5, label="pH entrada")
+        ax1.plot([d["dia"] for d in datos_14], [d["ph_out"] for d in datos_14],
+                 marker="o", color=COLOR_OK, linewidth=1.6, markersize=2.5, label="pH salida")
+        ax1.legend(fontsize=6, loc="lower right")
+        ax1.tick_params(labelsize=6, colors=COLOR_SUAVE)
+        ax1.grid(alpha=0.25)
+        for lado in ("top", "right"):
+            ax1.spines[lado].set_visible(False)
+        fig1.tight_layout()
+        FigureCanvasTkAgg(fig1, master=marco_g1).get_tk_widget().pack(fill="both", expand=True)
+
+        # -- Caudal diario, con degradado real verde→amarillo→rojo según el nivel de consumo
+        marco_g2 = tk.Frame(fila_graficas, bg=COLOR_PANEL)
+        marco_g2.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        tk.Label(marco_g2, text="Caudal diario · últimos 14 días",
+                font=("Segoe UI Semibold", 8), bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+
+        valores_caudal = [d["caudal"] for d in datos_14]
+        v_min, v_max = min(valores_caudal), max(valores_caudal)
+        promedio_caudal = sum(valores_caudal) / len(valores_caudal)
+
+        def _color_caudal(v):
+            """Degradado verde (bajo) -> amarillo (medio) -> rojo (alto) según la posición
+            relativa de v entre el mínimo y el máximo de la ventana de 14 días."""
+            if v_max - v_min < 1e-9:
+                return "#3b82f6"   # todos iguales: un azul neutro, caso borde
+            t = (v - v_min) / (v_max - v_min)   # 0 = mínimo, 1 = máximo
+            if t <= 0.5:
+                t2 = t / 0.5
+                r = int(0x22 + t2 * (0xea - 0x22))
+                g = int(0xc5 + t2 * (0xb3 - 0xc5))
+                b = int(0x5e + t2 * (0x08 - 0x5e))
+            else:
+                t2 = (t - 0.5) / 0.5
+                r = int(0xea + t2 * (0xef - 0xea))
+                g = int(0xb3 + t2 * (0x44 - 0xb3))
+                b = int(0x08 + t2 * (0x44 - 0x08))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        colores_caudal = [_color_caudal(v) for v in valores_caudal]
+
+        fig2 = Figure(figsize=(4.3, 1.45), dpi=100, facecolor=COLOR_PANEL)
+        ax2 = fig2.add_subplot(111)
+        ax2.bar([d["dia"] for d in datos_14], valores_caudal, color=colores_caudal)
+        ax2.axhline(promedio_caudal, color=COLOR_SUAVE, linestyle="--", linewidth=1)
+        ax2.tick_params(labelsize=6, colors=COLOR_SUAVE)
+        ax2.grid(axis="y", alpha=0.25)
+        for lado in ("top", "right"):
+            ax2.spines[lado].set_visible(False)
+        fig2.tight_layout()
+        FigureCanvasTkAgg(fig2, master=marco_g2).get_tk_widget().pack(fill="both", expand=True)
+
+        leyenda_caudal = tk.Frame(marco_g2, bg=COLOR_PANEL)
+        leyenda_caudal.pack(anchor="w", pady=(1, 0))
+        for texto, color in (("Bajo", "#22c55e"), ("Medio", "#eab308"), ("Alto", "#ef4444")):
+            chip = tk.Frame(leyenda_caudal, bg=COLOR_PANEL)
+            chip.pack(side="left", padx=(0, 8))
+            tk.Canvas(chip, width=8, height=8, bg=color, highlightthickness=0).pack(side="left")
+            tk.Label(chip, text=" " + texto, font=("Segoe UI", 6),
+                    bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(side="left")
+    else:
+        tk.Label(fila_graficas, text="Instale matplotlib para ver las gráficas (pip install matplotlib)",
+                font=FUENTE_SUB, bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(pady=30)
+
+    # ---------------------------------------------------------- PANELES INFERIORES
+    fila_paneles = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    fila_paneles.pack(fill="both", expand=True, pady=(8, 0))
+
+    # -- Próximos mantenimientos
+    p1 = tk.Frame(fila_paneles, bg="#f7f9fc", highlightbackground=COLOR_BORDE, highlightthickness=1)
+    p1.pack(side="left", fill="both", expand=True, padx=(0, 6), ipadx=3, ipady=3)
+    tk.Label(p1, text="📅 Próximos mantenimientos", font=("Segoe UI Semibold", 8),
+             bg="#f7f9fc", fg=COLOR_TEXTO).pack(anchor="w", padx=6, pady=(4, 3))
+    pendientes = sorted(
+        [m for m in MANTENIMIENTOS_HISTORIAL if m["estado"] != "Realizado"],
+        key=lambda m: m["proximo"])[:3]
+    if pendientes:
+        for m in pendientes:
+            f = tk.Frame(p1, bg="#f7f9fc")
+            f.pack(anchor="w", fill="x", padx=6, pady=1)
+            tk.Label(f, text=f"● {m['equipo']}", font=("Segoe UI Semibold", 7),
+                    bg="#f7f9fc", fg=COLOR_ACENTO).pack(anchor="w")
+            tk.Label(f, text=f"{m['tipo']} · {_mant_fecha_legible(m['proximo'])}",
+                    font=("Segoe UI", 6), bg="#f7f9fc", fg=COLOR_SUAVE).pack(anchor="w")
+    else:
+        tk.Label(p1, text="Sin mantenimientos pendientes.", font=("Segoe UI", 7),
+                bg="#f7f9fc", fg=COLOR_SUAVE).pack(anchor="w", padx=6, pady=3)
+
+    # -- Novedades recientes
+    p2 = tk.Frame(fila_paneles, bg="#f7f9fc", highlightbackground=COLOR_BORDE, highlightthickness=1)
+    p2.pack(side="left", fill="both", expand=True, padx=6, ipadx=3, ipady=3)
+    tk.Label(p2, text="🔔 Novedades recientes", font=("Segoe UI Semibold", 8),
+             bg="#f7f9fc", fg=COLOR_TEXTO).pack(anchor="w", padx=6, pady=(4, 3))
+    colores_tipo_novedad = {"Falla de equipo": "#fee2e2", "Mantenimiento": "#dbeafe",
+                            "Operativa": "#ede9fe", "Parada de planta": "#ffedd5", "Otra": "#f1f5f9"}
+    if NOVEDADES_HISTORIAL:
+        for n in NOVEDADES_HISTORIAL[:3]:
+            fondo = colores_tipo_novedad.get(n["tipo"], "#f1f5f9")
+            f = tk.Frame(p2, bg=fondo)
+            f.pack(anchor="w", fill="x", padx=6, pady=1, ipady=2, ipadx=4)
+            tk.Label(f, text=n["descripcion"], font=("Segoe UI", 7), bg=fondo,
+                    fg=COLOR_TEXTO, wraplength=190, justify="left").pack(anchor="w")
+            tk.Label(f, text=f"{n['tipo']} · {_novedad_fecha_legible(n['fecha'])} {n['hora']}",
+                    font=("Segoe UI", 6), bg=fondo, fg=COLOR_SUAVE).pack(anchor="w")
+    else:
+        tk.Label(p2, text="Sin novedades registradas.", font=("Segoe UI", 7),
+                bg="#f7f9fc", fg=COLOR_SUAVE).pack(anchor="w", padx=6, pady=3)
+
+    # -- Cumplimiento normativo (donut)
+    p3 = tk.Frame(fila_paneles, bg="#f7f9fc", highlightbackground=COLOR_BORDE, highlightthickness=1)
+    p3.pack(side="left", fill="both", expand=True, padx=(6, 0), ipadx=3, ipady=3)
+    tk.Label(p3, text="🛡 Cumplimiento normativo", font=("Segoe UI Semibold", 8),
+             bg="#f7f9fc", fg=COLOR_TEXTO).pack(anchor="w", padx=6, pady=(4, 3))
+    if HAY_GRAFICAS:
+        fig3 = Figure(figsize=(1.3, 1.3), dpi=100, facecolor="#f7f9fc")
+        ax3 = fig3.add_subplot(111)
+        color_dona = COLOR_OK if cumplimiento_pct >= 80 else ("#eab308" if cumplimiento_pct >= 60 else COLOR_ALERTA)
+        ax3.pie([cumplimiento_pct, 100 - cumplimiento_pct], colors=[color_dona, "#e2e8f0"],
+               startangle=90, counterclock=False, wedgeprops=dict(width=0.35))
+        ax3.text(0, 0, f"{cumplimiento_pct}%", ha="center", va="center",
+                fontsize=10, fontweight="bold", color=COLOR_TEXTO)
+        fig3.tight_layout()
+        FigureCanvasTkAgg(fig3, master=p3).get_tk_widget().pack()
+    else:
+        tk.Label(p3, text=f"{cumplimiento_pct}% de cumplimiento", font=("Segoe UI Semibold", 10),
+                bg="#f7f9fc", fg=COLOR_OK).pack(pady=8)
+    tk.Label(p3, text=f"Ingreso/Salida: {ultimo['caudal']:.2f} L/s · Operador: {OPERADOR_ACTUAL}",
+             font=("Segoe UI", 6), bg="#f7f9fc", fg=COLOR_SUAVE, wraplength=200,
+             justify="left").pack(anchor="w", padx=6, pady=(2, 4))
+
+    estado("Listo.")
+
+
+def abrir_analitica(tipo):
+    clave = "ph_in" if tipo == "Entrada" else "ph_out"
+    datos_14 = DIARIO_HISTORIAL[-14:]
+    valores_14 = [float(d[clave]) for d in datos_14]
+    ultimo_valor = valores_14[-1] if valores_14 else 7.0
+    en_rango = [PH_MIN <= v <= PH_MAX for v in valores_14]
+    cumplimiento_pct = round(100 * sum(en_rango) / len(en_rango)) if en_rango else 0
+    promedio_14 = round(sum(valores_14) / len(valores_14), 2) if valores_14 else 0.0
+    alertas_14 = sum(1 for v in valores_14 if not (PH_MIN <= v <= PH_MAX))
+
+    def _color_semaforo(valor):
+        if PH_MIN <= valor <= PH_MAX:
+            return COLOR_OK
+        if PH_MIN - 0.3 <= valor <= PH_MAX + 0.3:
+            return "#eab308"
+        return COLOR_ALERTA
+
+    color_actual = _color_semaforo(ultimo_valor)
+
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="both", expand=True, padx=22, pady=16)
+
+    tk.Label(cont, text=f"Control analítico · pH {tipo}", font=("Segoe UI Semibold", 14),
+             bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    tk.Label(cont, text=f"Monitoreo y registro de pH de {tipo.lower()} · rango seguro {PH_MIN}–{PH_MAX}",
+             font=("Segoe UI", 8), bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(1, 8))
+
+    tarjeta = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    tarjeta.pack(fill="both", expand=True)
+    cuerpo = tk.Frame(tarjeta, bg=COLOR_PANEL)
+    cuerpo.pack(fill="both", expand=True, padx=12, pady=10)
+
+    # ============================================================ KPIs con semáforo
+    fila_kpi = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    fila_kpi.pack(fill="x")
+    kpis = [
+        ("pH ACTUAL", f"{ultimo_valor:.2f}",
+         "● Dentro de norma" if PH_MIN <= ultimo_valor <= PH_MAX else "● Fuera de norma", color_actual),
+        ("CUMPLIMIENTO 14 DÍAS", f"{cumplimiento_pct}%", f"{sum(en_rango)}/{len(en_rango)} días en rango",
+         COLOR_OK if cumplimiento_pct >= 80 else ("#eab308" if cumplimiento_pct >= 60 else COLOR_ALERTA)),
+        ("PROMEDIO 14 DÍAS", f"{promedio_14:.2f}", f"Rango seguro {PH_MIN} – {PH_MAX}", COLOR_ACENTO),
+        ("ALERTAS ACTIVAS", str(alertas_14),
+         "Lecturas fuera de rango" if alertas_14 else "Sin novedades", COLOR_ALERTA if alertas_14 else COLOR_OK),
+    ]
+    for titulo, valor, sub, color in kpis:
+        c = tk.Frame(fila_kpi, bg="#f7f9fc", highlightbackground=COLOR_BORDE, highlightthickness=1)
+        c.pack(side="left", padx=(0, 6), ipadx=6, ipady=4, fill="x", expand=True)
+        tk.Label(c, text=titulo, font=("Segoe UI", 6, "bold"), bg="#f7f9fc",
+                fg=COLOR_SUAVE).pack(anchor="w", padx=6)
+        tk.Label(c, text=valor, font=("Segoe UI Semibold", 11), bg="#f7f9fc",
+                fg=color).pack(anchor="w", padx=6)
+        tk.Label(c, text=sub, font=("Segoe UI", 6), bg="#f7f9fc",
+                fg=color if titulo == "pH ACTUAL" else COLOR_SUAVE).pack(anchor="w", padx=6, pady=(1, 0))
+
+    # ============================================================ Barra visual interactiva
+    marco_barra = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    marco_barra.pack(fill="x", pady=(8, 2))
+    tk.Label(marco_barra, text="Escala de pH en tiempo real", font=("Segoe UI Semibold", 8),
+             bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+    canvas_barra = tk.Canvas(marco_barra, height=40, bg=COLOR_PANEL, highlightthickness=0)
+    canvas_barra.pack(fill="x", pady=(3, 0))
+    lbl_hover = tk.Label(marco_barra, text=" ", font=("Segoe UI", 7), bg=COLOR_PANEL, fg=COLOR_SUAVE)
+    lbl_hover.pack(anchor="w")
+
+    def _dibujar_barra(_evento=None):
+        canvas_barra.delete("all")
+        ancho = canvas_barra.winfo_width()
+        if ancho < 50:
+            ancho = 700
+        y0, alto = 10, 16
+
+        def x_de(v):
+            return int((v / 14) * ancho)
+
+        canvas_barra.create_rectangle(0, y0, x_de(PH_MIN), y0 + alto, fill="#fecaca", outline="")
+        canvas_barra.create_rectangle(x_de(PH_MIN), y0, x_de(PH_MAX), y0 + alto, fill="#bbf7d0", outline="")
+        canvas_barra.create_rectangle(x_de(PH_MAX), y0, ancho, y0 + alto, fill="#fecaca", outline="")
+        for marca in (0, PH_MIN, 7, PH_MAX, 14):
+            xm = x_de(marca)
+            canvas_barra.create_line(xm, y0, xm, y0 + alto, fill="white", width=1)
+            canvas_barra.create_text(xm, y0 + alto + 8, text=f"{marca:g}", font=("Segoe UI", 7), fill=COLOR_SUAVE)
+        xp = x_de(max(0, min(14, ultimo_valor)))
+        canvas_barra.create_polygon(xp - 5, y0 - 3, xp + 5, y0 - 3, xp, y0 + 2, fill=color_actual, outline="")
+        canvas_barra.create_text(xp, y0 - 9, text=f"{ultimo_valor:.2f}",
+                                 font=("Segoe UI Semibold", 8), fill=color_actual)
+
+    def _hover_barra(evento):
+        ancho = canvas_barra.winfo_width() or 700
+        valor_cursor = round((evento.x / ancho) * 14, 2)
+        lbl_hover.config(text=f"pH en esta posición del cursor: {valor_cursor:.2f}")
+
+    canvas_barra.bind("<Configure>", _dibujar_barra)
+    canvas_barra.bind("<Motion>", _hover_barra)
+    canvas_barra.bind("<Leave>", lambda e: lbl_hover.config(text=" "))
+
+    # ============================================================ Gráficas
+    fila_graficas = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    fila_graficas.pack(fill="both", expand=True, pady=(8, 0))
+
+    if HAY_GRAFICAS:
+        # -- Tendencia 14 días con zona segura
+        m1 = tk.Frame(fila_graficas, bg=COLOR_PANEL)
+        m1.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(m1, text=f"Tendencia pH {tipo} · 14 días", font=("Segoe UI Semibold", 8),
+                bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+        fig1 = Figure(figsize=(3.2, 1.6), dpi=100, facecolor=COLOR_PANEL)
+        ax1 = fig1.add_subplot(111)
+        ax1.axhspan(PH_MIN, PH_MAX, color=COLOR_OK, alpha=0.12)
+        ax1.axhline(PH_MIN, color=COLOR_ALERTA, linestyle="--", linewidth=1)
+        ax1.axhline(PH_MAX, color=COLOR_ALERTA, linestyle="--", linewidth=1)
+        colores_pts = [COLOR_OK if PH_MIN <= v <= PH_MAX else COLOR_ALERTA for v in valores_14]
+        ax1.plot([d["dia"] for d in datos_14], valores_14, color=COLOR_ACENTO, linewidth=1.8, zorder=2)
+        ax1.scatter([d["dia"] for d in datos_14], valores_14, color=colores_pts, zorder=3, s=20)
+        ax1.set_ylim(4, 10)
+        ax1.tick_params(labelsize=6, colors=COLOR_SUAVE)
+        ax1.grid(alpha=0.25)
+        for lado in ("top", "right"):
+            ax1.spines[lado].set_visible(False)
+        fig1.tight_layout()
+        FigureCanvasTkAgg(fig1, master=m1).get_tk_widget().pack(fill="both", expand=True)
+
+        # -- Donut cumplimiento normativo
+        m2 = tk.Frame(fila_graficas, bg=COLOR_PANEL)
+        m2.pack(side="left", fill="both", padx=6)
+        tk.Label(m2, text="Cumplimiento normativo", font=("Segoe UI Semibold", 8),
+                bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+        fig2 = Figure(figsize=(1.7, 1.6), dpi=100, facecolor=COLOR_PANEL)
+        ax2 = fig2.add_subplot(111)
+        color_dona = COLOR_OK if cumplimiento_pct >= 80 else ("#eab308" if cumplimiento_pct >= 60 else COLOR_ALERTA)
+        ax2.pie([cumplimiento_pct, 100 - cumplimiento_pct], colors=[color_dona, "#e2e8f0"],
+               startangle=90, counterclock=False, wedgeprops=dict(width=0.35))
+        ax2.text(0, 0, f"{cumplimiento_pct}%", ha="center", va="center",
+                 fontsize=11, fontweight="bold", color=color_dona)
+        ax2.set_aspect("equal")
+        fig2.tight_layout()
+        FigureCanvasTkAgg(fig2, master=m2).get_tk_widget().pack(fill="both", expand=True)
+
+        # -- Comparativa Entrada vs Salida
+        m3 = tk.Frame(fila_graficas, bg=COLOR_PANEL)
+        m3.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        tk.Label(m3, text="Comparativa Entrada vs Salida", font=("Segoe UI Semibold", 8),
+                bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+        fig3 = Figure(figsize=(3.4, 1.6), dpi=100, facecolor=COLOR_PANEL)
+        ax3 = fig3.add_subplot(111)
+        ax3.axhspan(PH_MIN, PH_MAX, color=COLOR_OK, alpha=0.10)
+        ax3.plot([d["dia"] for d in datos_14], [d["ph_in"] for d in datos_14], color=COLOR_ACENTO,
+                linewidth=(2.2 if tipo == "Entrada" else 1.1), marker="o", markersize=2.5, label="Entrada")
+        ax3.plot([d["dia"] for d in datos_14], [d["ph_out"] for d in datos_14], color="#7c3aed",
+                linewidth=(2.2 if tipo == "Salida" else 1.1), marker="o", markersize=2.5, label="Salida")
+        ax3.legend(fontsize=6, loc="lower right")
+        ax3.set_ylim(4, 10)
+        ax3.tick_params(labelsize=6, colors=COLOR_SUAVE)
+        ax3.grid(alpha=0.25)
+        for lado in ("top", "right"):
+            ax3.spines[lado].set_visible(False)
+        fig3.tight_layout()
+        FigureCanvasTkAgg(fig3, master=m3).get_tk_widget().pack(fill="both", expand=True)
+    else:
+        tk.Label(fila_graficas, text="Instale matplotlib para ver las gráficas (pip install matplotlib)",
+                font=FUENTE_SUB, bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(pady=30)
+
+    # ============================================================ Formulario + historial
+    fila_inferior = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    fila_inferior.pack(fill="both", expand=True, pady=(10, 0))
+
+    izq_borde = tk.Frame(fila_inferior, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    izq_borde.pack(side="left", fill="y", padx=(0, 10))
+    izq = tk.Frame(izq_borde, bg=COLOR_PANEL)
+    izq.pack(fill="both", expand=True, padx=14, pady=12)
+
+    tk.Label(izq, text="➕ Registrar lectura de pH", font=("Segoe UI Semibold", 9),
+             bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w", pady=(0, 6))
+    e_ph = campo(izq, "VALOR DE pH", f"{ultimo_valor:.1f}", 11)
+
+    fila_fh = tk.Frame(izq, bg=COLOR_PANEL)
+    fila_fh.pack(anchor="w", pady=(4, 0))
+    bloque_fecha = tk.Frame(fila_fh, bg=COLOR_PANEL)
+    bloque_fecha.pack(side="left", padx=(0, 8))
+    tk.Label(bloque_fecha, text="FECHA (DD/MM/AAAA)", font=("Segoe UI", 7),
+             bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(anchor="w")
+    e_fecha_ph = ttk.Entry(bloque_fecha, width=11, font=("Segoe UI", 8))
+    e_fecha_ph.pack()
+    e_fecha_ph.insert(0, datetime.datetime.now().strftime("%d/%m/%Y"))
+
+    bloque_hora = tk.Frame(fila_fh, bg=COLOR_PANEL)
+    bloque_hora.pack(side="left")
+    tk.Label(bloque_hora, text="HORA (HH:MM)", font=("Segoe UI", 7),
+             bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(anchor="w")
+    fila_hora = tk.Frame(bloque_hora, bg=COLOR_PANEL)
+    fila_hora.pack()
+    e_hora_ph = ttk.Entry(fila_hora, width=6, font=("Segoe UI", 8))
+    e_hora_ph.pack(side="left")
+    e_hora_ph.insert(0, datetime.datetime.now().strftime("%H:%M"))
+
+    def _poner_hora_actual():
+        e_hora_ph.delete(0, "end")
+        e_hora_ph.insert(0, datetime.datetime.now().strftime("%H:%M"))
+
+    tk.Button(fila_hora, text="Ahora", command=_poner_hora_actual, bg="#e2e8f0", fg=COLOR_MARCA,
+             font=("Segoe UI", 7, "bold"), relief="flat", cursor="hand2", padx=5).pack(side="left", padx=(4, 0))
+
+    lbl_error_ph = tk.Label(izq, text="", font=("Segoe UI", 7), bg=COLOR_PANEL, fg=COLOR_ALERTA)
+    lbl_error_ph.pack(anchor="w", pady=(4, 0))
+
+    def guardar_ph():
+        global CONTADOR_ALARMAS
+        try:
+            v_ph = a_float(e_ph, "Valor de pH")
+            if not (0 <= v_ph <= 14):
+                raise ValueError("El pH debe estar entre 0 y 14.")
+            try:
+                fecha_dt = datetime.datetime.strptime(e_fecha_ph.get().strip(), "%d/%m/%Y")
+            except ValueError:
+                raise ValueError("La fecha debe tener el formato DD/MM/AAAA.")
+            try:
+                datetime.datetime.strptime(e_hora_ph.get().strip(), "%H:%M")
+            except ValueError:
+                raise ValueError("La hora debe tener el formato HH:MM.")
+        except ValueError as err:
+            lbl_error_ph.config(text=str(err))
+            return
+        lbl_error_ph.config(text="")
+
+        nuevo = dict(DIARIO_HISTORIAL[-1])
+        nuevo["dia"] = fecha_dt.strftime("%d")
+        nuevo["mes"] = fecha_dt.strftime("%B").capitalize()
+        nuevo["ano"] = fecha_dt.strftime("%Y")
+        nuevo["hora_ph"] = e_hora_ph.get().strip()
+        nuevo[clave] = v_ph
+        nuevo["operador"] = OPERADOR_ACTUAL
+        DIARIO_HISTORIAL.append(nuevo)
+
+        guardar_ph_bd(
+            fecha_dt.strftime("%Y-%m-%d"), e_hora_ph.get().strip(), tipo, v_ph,
+            None, OPERADOR_ACTUAL, "Registro manual desde módulo pH"
+        )
+
+        if v_ph < PH_MIN or v_ph > PH_MAX:
+            CONTADOR_ALARMAS += 1
+            actualizar_alarmas()
+            messagebox.showwarning(
+                "pH fuera de rango",
+                f"El valor {v_ph:.2f} está fuera del rango permitido "
+                f"({PH_MIN} – {PH_MAX}). Se generó una alarma.")
+
+        estado(f"pH de {tipo.lower()} registrado: {v_ph:.2f}")
+        abrir_analitica(tipo)   # refresca KPIs, gráficas, barra e historial
+
+    boton_accion(izq, "Guardar lectura", guardar_ph, anchor="w", pady=(8, 0))
+
+    der_borde = tk.Frame(fila_inferior, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    der_borde.pack(side="left", fill="both", expand=True)
+    der = tk.Frame(der_borde, bg=COLOR_PANEL)
+    der.pack(fill="both", expand=True, padx=12, pady=10)
+
+    tk.Label(der, text=f"🕘 Historial de lecturas · pH {tipo}", font=("Segoe UI Semibold", 9),
+             bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+
+    cols_h = ("Día", "Mes", "Hora", f"pH {tipo}", "Estado", "Operador")
+    tabla_h = ttk.Treeview(der, columns=cols_h, show="headings", height=5)
+    for col, w in zip(cols_h, (45, 75, 55, 70, 95, 130)):
+        tabla_h.heading(col, text=col)
+        tabla_h.column(col, width=w, anchor="center")
+    tabla_h.tag_configure("dentro", background="#f0fdf4")
+    tabla_h.tag_configure("fuera", background="#fef2f2")
+    for d in reversed(datos_14):
+        valor = float(d[clave])
+        dentro = PH_MIN <= valor <= PH_MAX
+        tabla_h.insert("", "end", tags=("dentro" if dentro else "fuera",),
+                       values=(d["dia"], d["mes"], d.get("hora_ph", "—"),
+                               f"{valor:.2f}", "✔ Dentro" if dentro else "⚠ Fuera", d.get("operador", OPERADOR_ACTUAL)))
+    tabla_h.pack(fill="both", expand=True, pady=(4, 0))
+
+
+def abrir_aforo_volumetrico():
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="both", expand=True, padx=22, pady=16)
+    tk.Label(cont, text="Aforo Volumétrico · Medición de Caudal", font=("Segoe UI Semibold", 11),
+             bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    tk.Label(cont, text="Método: Recipiente 8L / Tiempo (s) = Caudal L/s · 2 decimales · Ej: 0.38 L/s",
+             font=("Segoe UI", 8), bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(2, 7))
+
+    ultimo = DIARIO_HISTORIAL[-1]
+    ultimos_7 = DIARIO_HISTORIAL[-7:]
+    promedio_semana = sum(x["caudal"] for x in ultimos_7) / len(ultimos_7)
+
+    kpi = tk.Frame(cont, bg=COLOR_FONDO)
+    kpi.pack(fill="x", pady=4)
+    for tit, val in [("Caudal Actual", f"{ultimo['caudal']:.2f} L/s"),
+                     ("Promedio semana", f"{promedio_semana:.2f} L/s"),
+                     ("Última medición", _fecha_visible_registro(ultimo))]:
+        c = tk.Frame(kpi, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+        c.pack(side="left", fill="both", expand=True, padx=5)
+        tk.Label(c, text=tit, font=("Segoe UI", 8, "bold"), bg=COLOR_PANEL,
+                fg=COLOR_SUAVE).pack(anchor="w", padx=12, pady=(8, 0))
+        tk.Label(c, text=val, font=("Segoe UI Semibold", 11), bg=COLOR_PANEL,
+                fg=COLOR_MARCA).pack(anchor="w", padx=12, pady=(0, 8))
+
+    main = tk.Frame(cont, bg=COLOR_FONDO)
+    main.pack(fill="both", expand=True, pady=8)
+    left = tk.Frame(main, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+    lb = tk.Frame(left, bg=COLOR_PANEL)
+    lb.pack(fill="x", padx=12, pady=10)
+
+    tk.Label(lb, text="Nuevo aforo · 3 mediciones de 8L", font=("Segoe UI Semibold", 11),
+             bg=COLOR_PANEL, fg=COLOR_MARCA).pack(anchor="w", pady=(0, 12))
+
+    f_top = tk.Frame(lb, bg=COLOR_PANEL)
+    f_top.pack(fill="x", pady=4)
+    tk.Label(f_top, text="Fecha:", font=("Segoe UI", 8), bg=COLOR_PANEL).pack(side="left")
+    e_fecha = ttk.Entry(f_top, width=12)
+    e_fecha.pack(side="left", padx=6)
+    e_fecha.insert(0, datetime.datetime.now().strftime("%d/%m/%Y"))
+    tk.Label(f_top, text="Operador:", font=("Segoe UI", 8), bg=COLOR_PANEL).pack(side="left", padx=(10, 2))
+    e_oper = ttk.Entry(f_top, width=18)
+    e_oper.pack(side="left", padx=6)
+    e_oper.insert(0, OPERADOR_ACTUAL)
+
+    tk.Label(lb, text="AFOROS VOLUMÉTRICOS 8L C/U · HORA MANUAL + BOTÓN AHORA", font=("Segoe UI", 9, "bold"),
+             bg=COLOR_PANEL).pack(anchor="w", pady=(14, 6))
+
+    hdr = tk.Frame(lb, bg="#0f2d59")
+    hdr.pack(fill="x")
+    for t, w in [("No.", 4), ("Hora del aforo", 12), ("Segundos (s)", 12), ("Caudal parcial", 12), ("", 8)]:
+        tk.Label(hdr, text=t, font=("Segoe UI", 8, "bold"), bg="#0f2d59", fg="white", width=w).pack(
+            side="left", padx=2, pady=6)
+
+    aforos = []
+
+    def poner_ahora(entry_hora):
+        ahora = datetime.datetime.now().strftime("%H:%M")
+        entry_hora.delete(0, "end")
+        entry_hora.insert(0, ahora)
+        calc()
+
+    for i, (h, s) in enumerate([("08:00", "25.30"), ("10:30", "25.10"), ("13:15", "25.60")], start=1):
+        row = tk.Frame(lb, bg="#f8fafc" if i % 2 == 0 else COLOR_PANEL,
+                       highlightbackground=COLOR_BORDE, highlightthickness=1)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=f"{i}", font=("Segoe UI", 9, "bold"), bg=row.cget("bg"), width=4).pack(
+            side="left", padx=2, pady=6)
+        e_h = ttk.Entry(row, width=12, font=("Segoe UI", 9, "bold"))
+        e_h.pack(side="left", padx=4)
+        e_h.insert(0, h)
+        e_s = ttk.Entry(row, width=12, font=("Segoe UI", 8))
+        e_s.pack(side="left", padx=4)
+        e_s.insert(0, s)
+        lbl_c = tk.Label(row, text="0.32 L/s", bg=row.cget("bg"), fg=COLOR_ACENTO,
+                         font=("Segoe UI", 9, "bold"), width=12)
+        lbl_c.pack(side="left", padx=4)
+        tk.Button(row, text="Ahora", font=("Segoe UI", 7, "bold"), bg="#e2e8f0", fg=COLOR_MARCA,
+                 relief="flat", cursor="hand2", padx=8, pady=4,
+                 command=lambda eh=e_h: poner_ahora(eh)).pack(side="left", padx=2)
+        aforos.append((e_h, e_s, lbl_c))
+
+    # === RESULTADO GRANDE Y VISIBLE - CAUDAL L/S ===
+    res_frame = tk.Frame(lb, bg="#0f2d59", highlightbackground=COLOR_MARCA, highlightthickness=2)
+    res_frame.pack(fill="x", pady=16)
+    res_inner = tk.Frame(res_frame, bg="#0f2d59")
+    res_inner.pack(fill="x", padx=2, pady=2)
+
+    left_res = tk.Frame(res_inner, bg="#0f2d59")
+    left_res.pack(side="left", fill="x", expand=True, padx=16, pady=12)
+    lbl_prom = tk.Label(left_res, text="Tiempo promedio: — s", font=("Segoe UI", 8),
+                        bg="#0f2d59", fg="#a9bede")
+    lbl_prom.pack(anchor="w")
+    lbl_detalle = tk.Label(left_res, text="Cálculo: 8L / — s = — L/s", font=("Segoe UI", 8),
+                           bg="#0f2d59", fg="#a9bede")
+    lbl_detalle.pack(anchor="w", pady=(4, 0))
+
+    right_res = tk.Frame(res_inner, bg="#0f2d59")
+    right_res.pack(side="right", padx=16, pady=12)
+    tk.Label(right_res, text="RESULTADO FINAL", font=("Segoe UI", 8, "bold"),
+             bg="#0f2d59", fg="#a9bede").pack(anchor="e")
+    lbl_caudal = tk.Label(right_res, text="— L/s", font=("Segoe UI Semibold", 14), bg="#0f2d59", fg="white")
+    lbl_caudal.pack(anchor="e")
+    lbl_estado_aforo = tk.Label(right_res, text="Faltan 3 aforos", font=("Segoe UI", 8),
+                                bg="#ed8936", fg="white", padx=8, pady=2)
+    lbl_estado_aforo.pack(anchor="e", pady=(4, 0))
+
+    def calc():
+        try:
+            segs = []
+            for eh, es, lc in aforos:
+                txt = es.get().strip()
+                if txt in ("", "0"):
+                    lc.config(text="-- L/s")
+                    continue
+                s = float(txt.replace(",", "."))
+                segs.append(s)
+                caudal_p = 8.0 / s if s > 0 else 0
+                lc.config(text=f"{caudal_p:.2f} L/s")  # 2 decimales, ej. 0.38
+            if len(segs) == 3:
+                prom = sum(segs) / len(segs)
+                caudal = 8.0 / prom if prom > 0 else 0
+                lbl_prom.config(text=f"Tiempo promedio: {prom:.2f} s ({' + '.join(f'{x:.2f}' for x in segs)} / 3)")
+                lbl_detalle.config(text=f"Cálculo: 8L / {prom:.2f}s = {caudal:.2f} L/s")
+                lbl_caudal.config(text=f"{caudal:.2f} L/s")
+                lbl_estado_aforo.config(text="3 aforos completados · LISTO PARA GUARDAR", bg=COLOR_OK)
+                return prom, caudal
+            elif len(segs) > 0:
+                prom = sum(segs) / len(segs)
+                caudal = 8.0 / prom if prom > 0 else 0
+                lbl_prom.config(text=f"Tiempo promedio parcial: {prom:.2f} s ({len(segs)}/3)")
+                lbl_caudal.config(text=f"{caudal:.2f} L/s (parcial)")
+                lbl_estado_aforo.config(text=f"Faltan {3 - len(segs)} aforo(s)", bg="#ed8936")
+                return prom, caudal
+            else:
+                lbl_prom.config(text="Tiempo promedio: — s")
+                lbl_detalle.config(text="Cálculo: 8L / — s = — L/s")
+                lbl_caudal.config(text="— L/s")
+                lbl_estado_aforo.config(text="Faltan 3 aforos", bg="#ed8936")
+        except Exception:
+            return None
+
+    for _, es, _ in aforos:
+        es.bind("<KeyRelease>", lambda e: calc())
+        es.bind("<FocusOut>", lambda e: calc())
+
+    def guardar():
+        r = calc()
+        completados = [es for _, es, _ in aforos if es.get().strip() not in ("", "0")]
+        if not r or len(completados) < 3:
+            messagebox.showwarning("Aviso", "Debe completar los 3 aforos con segundos.")
+            return
+
+        fecha_parseada = _parse_fecha_ddmmaaaa(e_fecha.get())
+        if not fecha_parseada:
+            messagebox.showerror("Fecha inválida", "Ingrese la fecha en formato DD/MM/AAAA.")
+            return
+
+        prom, caudal = r
+        horas = [eh.get() for eh, _, _ in aforos]
+        dia, mes, ano = fecha_parseada
+        base = DIARIO_HISTORIAL[-1]
+
+        DIARIO_HISTORIAL.append({
+            "planta": "BELLAVISTA", "dia": dia, "mes": mes, "ano": ano,
+            "caudal": round(caudal, 2),
+            "ph_in": base["ph_in"], "ph_out": base["ph_out"],
+            "horometro": base["horometro"] + 1,
+            "ingreso": base["ingreso"], "salida": base["salida"],
+            "coagulante": base["coagulante"], "floculante": base["floculante"],
+            "fecha": e_fecha.get(), "operador": e_oper.get().strip() or OPERADOR_ACTUAL,
+            "horas_aforo": horas, "prom": prom,
+        })
+
+        guardar_aforo_bd(
+            f"{ano}-{MESES_NUM.get(mes, str(datetime.datetime.now().month).zfill(2))}-{int(dia):02d}",
+            horas[0], 8.0, prom, caudal, e_oper.get().strip() or OPERADOR_ACTUAL,
+            "Aforo volumétrico de 3 mediciones"
+        )
+
+        messagebox.showinfo(
+            "Guardado OK",
+            f"Aforo guardado\n\nHoras:\n{horas[0]}\n{horas[1]}\n{horas[2]}\n\n"
+            f"Tiempo promedio: {prom:.2f} s\nCAUDAL FINAL: {caudal:.2f} L/s")
+        estado(f"Aforo guardado · caudal {caudal:.2f} L/s")
+        abrir_aforo_volumetrico()
+
+    tk.Button(lb, text="GUARDAR AFORO · RESULTADO FINAL", command=guardar, bg="#0f2d59", fg="white",
+             font=("Segoe UI Semibold", 10), relief="flat", pady=10).pack(fill="x", pady=14)
+
+    # ---- Historial reciente a la derecha
+    right = tk.Frame(main, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    right.pack(side="left", fill="both", padx=(6, 0))
+    rb = tk.Frame(right, bg=COLOR_PANEL)
+    rb.pack(fill="both", expand=True, padx=14, pady=14)
+    tk.Label(rb, text="Últimos aforos", font=("Segoe UI Semibold", 11), bg=COLOR_PANEL,
+             fg=COLOR_MARCA).pack(anchor="w", pady=(0, 8))
+    cols_r = ("Fecha", "Caudal (L/s)")
+    tabla_r = ttk.Treeview(rb, columns=cols_r, show="headings", height=10)
+    for col, w in zip(cols_r, (100, 100)):
+        tabla_r.heading(col, text=col)
+        tabla_r.column(col, width=w, anchor="center")
+    for r in reversed(DIARIO_HISTORIAL[-10:]):
+        tabla_r.insert("", "end", values=(_fecha_visible_registro(r), f"{r['caudal']:.2f}"))
+    tabla_r.pack(fill="both", expand=True)
+
+    calc()
+
+
+def abrir_horarios():
+    # BUG ORIGINAL: f = tk.LabelFrame(...).pack(...)  ->  f quedaba en None.
+    cuerpo = panel("Horarios de turno", "Marcación de ingreso y salida del operador")
+    e_in  = campo(cuerpo, "HORA DE INGRESO (HH:MM)", "06:00", 14)
+    e_out = campo(cuerpo, "HORA DE SALIDA (HH:MM)",  "14:00", 14)
+
+    def guardar():
+        def valida(t):
+            try:
+                datetime.datetime.strptime(t.strip(), "%H:%M")
+                return True
+            except ValueError:
+                return False
+        if not (valida(e_in.get()) and valida(e_out.get())):
+            messagebox.showerror("Formato incorrecto",
+                                 "Use el formato de 24 horas, por ejemplo 06:00.")
+            return
+        estado(f"Turno sincronizado {e_in.get()} – {e_out.get()}")
+        messagebox.showinfo("Turno sincronizado",
+                            f"Ingreso {e_in.get()} · Salida {e_out.get()}")
+
+    boton_accion(cuerpo, "Guardar turno", guardar, anchor="w", pady=(18, 0))
+
+
+# ---- Configuración del módulo de Mantenimiento (formulario + bitácora + historial)
+EQUIPOS_MANTENIMIENTO = ["Bomba", "Soplante", "DAF", "Homogeneizador 1", "Homogeneizador 2",
+                         "Trampa de Grasas", "Lecho de Secado", "Filtro de arena N°3",
+                         "Sensor de pH", "Otro"]
+TIPOS_MANTENIMIENTO = ["Preventivo", "Correctivo", "Predictivo"]
+PRIORIDADES_MANTENIMIENTO = ["Baja", "Media", "Alta"]
+COLOR_PRIORIDAD = {
+    "Baja":  ("#dcfce7", "#15803d"),
+    "Media": ("#fef9c3", "#a16207"),
+    "Alta":  ("#fee2e2", "#b91c1c"),
+}
+ESTADOS_MANTENIMIENTO = ["Programado", "Realizado", "Pendiente"]
+TAG_POR_TIPO_MANT = {"Preventivo": "tm_prev", "Correctivo": "tm_corr", "Predictivo": "tm_pred"}
+
+HOROMETRO_ACTUAL_BOMBA = 11384
+
+# id descendente = más reciente primero
+MANTENIMIENTOS_HISTORIAL = [
+    {"id": 4, "fecha": "2026-09-22", "equipo": "Bomba", "tipo": "Preventivo", "prioridad": "Media",
+     "descripcion": "Cambio de aceite y limpieza de filtro", "responsable": "Juan Pérez",
+     "horometro": 11272, "repuestos": "Filtro de aceite, 4L aceite SAE 30",
+     "tiempo_horas": 1.5, "proximo": "2026-10-22", "estado": "Realizado"},
+    {"id": 3, "fecha": "2026-09-18", "equipo": "Soplante", "tipo": "Correctivo", "prioridad": "Alta",
+     "descripcion": "Reparación de vibración en cojinete #2", "responsable": "María López",
+     "horometro": 11150, "repuestos": "Rodamiento 6205-2RS",
+     "tiempo_horas": 3.0, "proximo": "2026-09-18", "estado": "Pendiente"},
+    {"id": 2, "fecha": "2026-09-12", "equipo": "DAF", "tipo": "Preventivo", "prioridad": "Media",
+     "descripcion": "Inspección mensual de paletas y raspador", "responsable": "Carlos Ruiz",
+     "horometro": 11020, "repuestos": "",
+     "tiempo_horas": 1.0, "proximo": "2026-10-12", "estado": "Realizado"},
+    {"id": 1, "fecha": "2026-09-05", "equipo": "Bomba", "tipo": "Predictivo", "prioridad": "Baja",
+     "descripcion": "Análisis vibracional programado", "responsable": "Juan Pérez",
+     "horometro": 10880, "repuestos": "",
+     "tiempo_horas": 0.5, "proximo": "2026-10-05", "estado": "Realizado"},
+]
+
+
+def _mant_fecha_legible(fecha_iso):
+    a, m, d = fecha_iso.split("-")
+    return f"{d}/{m}/{a}"
+
+
+def _mant_fecha_a_iso(texto):
+    try:
+        return datetime.datetime.strptime(texto.strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _mant_exportar_texto(m):
+    """Genera un archivo de texto plano con el detalle del mantenimiento.
+    Nota: se exporta como .txt (no .pdf real) porque el proyecto no usa librerías
+    externas vía pip (habría que instalar reportlab para un PDF de verdad)."""
+    contenido = (
+        "PTAR BELLAVISTA - REGISTRO DE MANTENIMIENTO\n"
+        "=============================================\n"
+        f"Fecha: {_mant_fecha_legible(m['fecha'])}\n"
+        f"Equipo: {m['equipo']}\n"
+        f"Tipo: {m['tipo']}\n"
+        f"Prioridad: {m['prioridad']}\n"
+        f"Responsable: {m['responsable']}\n"
+        f"Horómetro: {m['horometro']} h\n"
+        f"Descripción de actividad: {m['descripcion']}\n"
+        f"Repuestos usados: {m['repuestos'] or '—'}\n"
+        f"Tiempo empleado: {m['tiempo_horas']} h\n"
+        f"Próximo mantenimiento: {_mant_fecha_legible(m['proximo'])}\n"
+        f"Estado: {m['estado']}\n"
+    )
+    ruta = filedialog.asksaveasfilename(
+        title="Exportar registro de mantenimiento",
+        defaultextension=".txt",
+        initialfile=f"mantenimiento_{m['id']}.txt",
+        filetypes=[("Archivo de texto", "*.txt")])
+    if not ruta:
+        return
+    with open(ruta, "w", encoding="utf-8") as f:
+        f.write(contenido)
+    messagebox.showinfo("Exportado", f"Registro guardado en:\n{ruta}")
+
+
+def abrir_mantenimiento():
+    global HOROMETRO_ACTUAL_BOMBA
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="x", padx=18, pady=12)
+
+    tk.Label(cont, text="Registro de mantenimiento", font=FUENTE_TITULO,
+             bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    tk.Label(cont, text="Gestiona los mantenimientos preventivos, correctivos y predictivos de los equipos",
+             font=FUENTE_SUB, bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(2, 10))
+
+    # ============================================================ KPIs
+    fila_kpi = tk.Frame(cont, bg=COLOR_FONDO)
+    fila_kpi.pack(fill="x", pady=(0, 8))
+
+    total = len(MANTENIMIENTOS_HISTORIAL)
+    preventivos = sum(1 for m in MANTENIMIENTOS_HISTORIAL if m["tipo"] == "Preventivo")
+    correctivos = sum(1 for m in MANTENIMIENTOS_HISTORIAL if m["tipo"] == "Correctivo")
+    pct_prev = round(100 * preventivos / total) if total else 0
+    pct_corr = round(100 * correctivos / total) if total else 0
+
+    kpis = [
+        ("TOTAL INTERVENCIONES", str(total), "Histórico registrado", COLOR_MARCA),
+        ("PREVENTIVOS", str(preventivos), f"{pct_prev}% del total", COLOR_OK),
+        ("CORRECTIVOS", str(correctivos), f"{pct_corr}% del total", "#c2410c"),
+        ("HORÓMETRO ACTUAL", f"{HOROMETRO_ACTUAL_BOMBA:,} h", "Última lectura registrada", COLOR_ACENTO),
+    ]
+    for titulo, valor, sub, color in kpis:
+        c = tk.Frame(fila_kpi, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+        c.pack(side="left", padx=(0, 7), ipadx=7, ipady=5, fill="x", expand=True)
+        tk.Label(c, text=titulo, font=("Segoe UI", 7, "bold"), bg=COLOR_PANEL,
+                fg=COLOR_SUAVE).pack(anchor="w", padx=8)
+        tk.Label(c, text=valor, font=("Segoe UI Semibold", 14), bg=COLOR_PANEL,
+                fg=color).pack(anchor="w", padx=8)
+        tk.Label(c, text=sub, font=("Segoe UI", 7), bg=COLOR_PANEL,
+                fg=COLOR_SUAVE).pack(anchor="w", padx=8, pady=(1, 0))
+
+    # ============================================================ TARJETA FORMULARIO
+    tarjeta_a = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    tarjeta_a.pack(fill="x", pady=(0, 8))
+    cuerpo_a = tk.Frame(tarjeta_a, bg=COLOR_PANEL)
+    cuerpo_a.pack(fill="x", padx=14, pady=10)
+
+    tk.Label(cuerpo_a, text="➕  Nuevo mantenimiento", font=("Segoe UI Semibold", 10),
+             bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w", pady=(0, 10))
+
+    def _col(padre):
+        f = tk.Frame(padre, bg=COLOR_PANEL)
+        f.pack(side="left", padx=(0, 14), fill="x", expand=True)
+        return f
+
+    def _etiqueta(padre, texto):
+        tk.Label(padre, text=texto, font=("Segoe UI", 8), bg=COLOR_PANEL,
+                fg=COLOR_SUAVE).pack(anchor="w")
+
+    fila1 = tk.Frame(cuerpo_a, bg=COLOR_PANEL)
+    fila1.pack(fill="x", pady=(0, 5))
+    c1 = _col(fila1); _etiqueta(c1, "EQUIPO")
+    cb_equipo = ttk.Combobox(c1, state="readonly", values=EQUIPOS_MANTENIMIENTO, font=("Segoe UI", 8))
+    cb_equipo.current(0); cb_equipo.pack(fill="x")
+
+    c2 = _col(fila1); _etiqueta(c2, "TIPO")
+    cb_tipo_m = ttk.Combobox(c2, state="readonly", values=TIPOS_MANTENIMIENTO, font=("Segoe UI", 8))
+    cb_tipo_m.current(0); cb_tipo_m.pack(fill="x")
+
+    c3 = _col(fila1); _etiqueta(c3, "PRIORIDAD")
+    fila_prioridad = tk.Frame(c3, bg=COLOR_PANEL); fila_prioridad.pack(fill="x")
+    cb_prioridad = ttk.Combobox(fila_prioridad, state="readonly", values=PRIORIDADES_MANTENIMIENTO,
+                                font=("Segoe UI", 8), width=8)
+    cb_prioridad.current(1); cb_prioridad.pack(side="left")
+    lbl_pastilla = tk.Label(fila_prioridad, text=" Media ", font=("Segoe UI", 8, "bold"),
+                            bg="#fef9c3", fg="#a16207")
+    lbl_pastilla.pack(side="left", padx=(6, 0))
+
+    def _actualizar_pastilla(_evento=None):
+        fondo, letra = COLOR_PRIORIDAD.get(cb_prioridad.get(), ("#f1f5f9", COLOR_SUAVE))
+        lbl_pastilla.config(text=f" {cb_prioridad.get()} ", bg=fondo, fg=letra)
+
+    cb_prioridad.bind("<<ComboboxSelected>>", _actualizar_pastilla)
+
+    c4 = _col(fila1); _etiqueta(c4, "FECHA (DD/MM/AAAA)")
+    e_fecha_m = ttk.Entry(c4, font=("Segoe UI", 8))
+    e_fecha_m.insert(0, datetime.datetime.now().strftime("%d/%m/%Y")); e_fecha_m.pack(fill="x")
+
+    fila2 = tk.Frame(cuerpo_a, bg=COLOR_PANEL)
+    fila2.pack(fill="x", pady=(0, 8))
+    c5 = _col(fila2); _etiqueta(c5, "RESPONSABLE")
+    e_responsable = ttk.Entry(c5, font=("Segoe UI", 8)); e_responsable.pack(fill="x")
+
+    c6 = _col(fila2); _etiqueta(c6, "HORÓMETRO (H)")
+    e_horometro_m = ttk.Entry(c6, font=("Segoe UI", 8)); e_horometro_m.pack(fill="x")
+
+    c7 = _col(fila2); _etiqueta(c7, "TIEMPO EMPLEADO (H)")
+    e_tiempo_m = ttk.Entry(c7, font=("Segoe UI", 8)); e_tiempo_m.pack(fill="x")
+
+    c8 = _col(fila2); _etiqueta(c8, "PRÓXIMO MANTENIMIENTO (DD/MM/AAAA)")
+    e_proximo_m = ttk.Entry(c8, font=("Segoe UI", 8)); e_proximo_m.pack(fill="x")
+
+    _etiqueta(cuerpo_a, "DESCRIPCIÓN DE ACTIVIDAD")
+    e_descripcion_m = ttk.Entry(cuerpo_a, font=("Segoe UI", 8)); e_descripcion_m.pack(fill="x", pady=(0, 8))
+
+    fila3 = tk.Frame(cuerpo_a, bg=COLOR_PANEL)
+    fila3.pack(fill="x", pady=(0, 8))
+    c9 = _col(fila3); _etiqueta(c9, "REPUESTOS USADOS")
+    e_repuestos = ttk.Entry(c9, font=("Segoe UI", 8)); e_repuestos.pack(fill="x")
+
+    c10 = _col(fila3); _etiqueta(c10, "ESTADO")
+    cb_estado_m = ttk.Combobox(c10, state="readonly", values=ESTADOS_MANTENIMIENTO, font=("Segoe UI", 8))
+    cb_estado_m.current(0); cb_estado_m.pack(fill="x")
+
+    lbl_evidencia = tk.Label(cuerpo_a, text="Ningún archivo seleccionado.", font=("Segoe UI", 8),
+                             bg=COLOR_PANEL, fg=COLOR_SUAVE)
+
+    def _cargar_evidencia():
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar evidencia fotográfica",
+            filetypes=[("Imágenes", "*.png *.jpg *.jpeg"), ("Todos", "*.*")])
+        if ruta:
+            lbl_evidencia.config(text=f"📎 {ruta}", fg=COLOR_OK)
+
+    fila_evidencia = tk.Frame(cuerpo_a, bg=COLOR_PANEL)
+    fila_evidencia.pack(fill="x", pady=(0, 4))
+    tk.Button(fila_evidencia, text="📷 Adjuntar imagen", command=_cargar_evidencia,
+             bg="#f1f5f9", fg=COLOR_TEXTO, font=("Segoe UI", 8), relief="flat",
+             cursor="hand2", padx=10, pady=5).pack(side="left")
+    lbl_evidencia.pack(side="left", padx=10)
+
+    lbl_error_m = tk.Label(cuerpo_a, text="", font=("Segoe UI", 8), bg=COLOR_PANEL, fg=COLOR_ALERTA)
+    lbl_error_m.pack(anchor="w", pady=(4, 0))
+
+    def _cancelar_formulario():
+        e_responsable.delete(0, "end")
+        e_horometro_m.delete(0, "end")
+        e_tiempo_m.delete(0, "end")
+        e_proximo_m.delete(0, "end")
+        e_descripcion_m.delete(0, "end")
+        e_repuestos.delete(0, "end")
+        e_fecha_m.delete(0, "end")
+        e_fecha_m.insert(0, datetime.datetime.now().strftime("%d/%m/%Y"))
+        lbl_evidencia.config(text="Ningún archivo seleccionado.", fg=COLOR_SUAVE)
+        lbl_error_m.config(text="")
+
+    def _guardar_mantenimiento():
+        global HOROMETRO_ACTUAL_BOMBA
+        descripcion = e_descripcion_m.get().strip()
+        responsable = e_responsable.get().strip()
+        fecha_iso = _mant_fecha_a_iso(e_fecha_m.get())
+        proximo_iso = _mant_fecha_a_iso(e_proximo_m.get())
+
+        if not descripcion:
+            lbl_error_m.config(text="Escriba la descripción de la actividad."); return
+        if not responsable:
+            lbl_error_m.config(text="Escriba el responsable del mantenimiento."); return
+        if not fecha_iso:
+            lbl_error_m.config(text="La fecha debe tener formato DD/MM/AAAA."); return
+        if not proximo_iso:
+            lbl_error_m.config(text="La fecha del próximo mantenimiento debe tener formato DD/MM/AAAA."); return
+        try:
+            horometro_val = a_float(e_horometro_m, "Horómetro")
+            tiempo_val = a_float(e_tiempo_m, "Tiempo empleado")
+        except ValueError as err:
+            lbl_error_m.config(text=str(err)); return
+
+        lbl_error_m.config(text="")
+        nuevo_id = (max((m["id"] for m in MANTENIMIENTOS_HISTORIAL), default=0)) + 1
+        MANTENIMIENTOS_HISTORIAL.insert(0, {
+            "id": nuevo_id, "fecha": fecha_iso, "equipo": cb_equipo.get(), "tipo": cb_tipo_m.get(),
+            "prioridad": cb_prioridad.get(), "descripcion": descripcion, "responsable": responsable,
+            "horometro": horometro_val, "repuestos": e_repuestos.get().strip(),
+            "tiempo_horas": tiempo_val, "proximo": proximo_iso, "estado": cb_estado_m.get(),
+        })
+
+        guardar_mantenimiento_bd({
+            "fecha": fecha_iso, "equipo": cb_equipo.get(), "tipo": cb_tipo_m.get(),
+            "prioridad": cb_prioridad.get(), "descripcion": descripcion, "responsable": responsable,
+            "horometro": horometro_val, "repuestos": e_repuestos.get().strip(),
+            "tiempo_horas": tiempo_val, "proximo": proximo_iso, "estado": cb_estado_m.get()
+        })
+
+        if cb_equipo.get() == "Bomba" and horometro_val > HOROMETRO_ACTUAL_BOMBA:
+            HOROMETRO_ACTUAL_BOMBA = horometro_val
+
+        estado(f"Mantenimiento de {cb_equipo.get()} guardado en la bitácora.")
+        abrir_mantenimiento()   # refresca KPIs, formulario e historial
+
+    fila_botones = tk.Frame(cuerpo_a, bg=COLOR_PANEL)
+    fila_botones.pack(fill="x", pady=(10, 0))
+    tk.Button(fila_botones, text="Cancelar", command=_cancelar_formulario, bg="#f1f5f9",
+             fg=COLOR_TEXTO, font=("Segoe UI", 8), relief="flat", cursor="hand2",
+             padx=16, pady=8).pack(side="right", padx=(8, 0))
+    tk.Button(fila_botones, text="🗂  Guardar en bitácora", command=_guardar_mantenimiento,
+             bg=COLOR_MARCA, fg="white", font=("Segoe UI Semibold", 9), relief="flat",
+             cursor="hand2", padx=16, pady=8, activebackground=COLOR_MARCA_HOVER,
+             activeforeground="white").pack(side="right")
+
+    # ============================================================ TARJETA HISTORIAL
+    tarjeta_b = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    tarjeta_b.pack(fill="both", expand=True)
+    cuerpo_b = tk.Frame(tarjeta_b, bg=COLOR_PANEL)
+    cuerpo_b.pack(fill="both", expand=True, padx=18, pady=14)
+
+    tk.Label(cuerpo_b, text="🗂  Historial de mantenimientos realizados", font=("Segoe UI Semibold", 10),
+             bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(anchor="w")
+
+    filtros = tk.Frame(cuerpo_b, bg=COLOR_PANEL)
+    filtros.pack(fill="x", pady=(10, 4))
+
+    def _bloque_filtro(padre, etiqueta, ancho=16):
+        f = tk.Frame(padre, bg=COLOR_PANEL)
+        f.pack(side="left", padx=(0, 8))
+        tk.Label(f, text=etiqueta, font=("Segoe UI", 7), bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(anchor="w")
+        e = ttk.Entry(f, width=ancho, font=("Segoe UI", 8))
+        e.pack()
+        return e
+
+    e_buscar_m = _bloque_filtro(filtros, "BUSCAR (DESCRIPCIÓN / RESPONSABLE)", 22)
+    e_desde_m = _bloque_filtro(filtros, "DESDE (DD/MM/AAAA)", 12)
+    e_hasta_m = _bloque_filtro(filtros, "HASTA (DD/MM/AAAA)", 12)
+
+    f_tipo_m = tk.Frame(filtros, bg=COLOR_PANEL)
+    f_tipo_m.pack(side="left", padx=(0, 8))
+    tk.Label(f_tipo_m, text="TIPO", font=("Segoe UI", 7), bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(anchor="w")
+    cb_filtro_tipo_m = ttk.Combobox(f_tipo_m, state="readonly", width=13, font=("Segoe UI", 8),
+                                    values=["Todos"] + TIPOS_MANTENIMIENTO)
+    cb_filtro_tipo_m.set("Todos"); cb_filtro_tipo_m.pack()
+
+    btn_limpiar_m = tk.Button(filtros, text="⟲ Limpiar", bg="#f1f5f9", fg=COLOR_TEXTO,
+                              font=("Segoe UI", 8), relief="flat", bd=0, cursor="hand2",
+                              padx=10, pady=5)
+    btn_limpiar_m.pack(side="left", anchor="s")
+
+    marco_tabla = tk.Frame(cuerpo_b, bg=COLOR_PANEL)
+    marco_tabla.pack(fill="both", expand=True, pady=(10, 4))
+
+    cols_m = ("Fecha", "Equipo", "Tipo", "Descripción", "Responsable", "Horómetro", "Próximo", "Estado", "Acción")
+    tabla_m = ttk.Treeview(marco_tabla, columns=cols_m, show="headings", height=6)
+    scroll_v_m = ttk.Scrollbar(marco_tabla, orient="vertical", command=tabla_m.yview)
+    tabla_m.configure(yscrollcommand=scroll_v_m.set)
+    tabla_m.pack(side="left", fill="both", expand=True)
+    scroll_v_m.pack(side="right", fill="y")
+
+    anchos_m = {"Fecha": 80, "Equipo": 95, "Tipo": 85, "Descripción": 210, "Responsable": 100,
+               "Horómetro": 75, "Próximo": 80, "Estado": 85, "Acción": 95}
+    for col in cols_m:
+        tabla_m.heading(col, text=col)
+        tabla_m.column(col, width=anchos_m[col],
+                       anchor="w" if col in ("Descripción", "Responsable") else "center")
+
+    for tag, color in (("tm_prev", "#eff6ff"), ("tm_corr", "#fff7ed"), ("tm_pred", "#f5f3ff")):
+        tabla_m.tag_configure(tag, background=color)
+
+    fila_pie = tk.Frame(cuerpo_b, bg=COLOR_PANEL)
+    fila_pie.pack(fill="x", pady=(4, 0))
+    lbl_pie_m = tk.Label(fila_pie, font=("Segoe UI", 8), bg=COLOR_PANEL, fg=COLOR_SUAVE)
+    lbl_pie_m.pack(side="left")
+
+    POR_PAGINA = 4
+    estado_paginacion = {"pagina": 0}
+
+    def refrescar_tabla_m(_evento=None):
+        estado_paginacion["pagina"] = 0
+        _render_pagina()
+
+    def _filtrados():
+        q = e_buscar_m.get().strip().lower()
+        desde = _mant_fecha_a_iso(e_desde_m.get())
+        hasta = _mant_fecha_a_iso(e_hasta_m.get())
+        tipo_sel = cb_filtro_tipo_m.get()
+
+        resultado = []
+        for m in MANTENIMIENTOS_HISTORIAL:
+            if q and q not in m["descripcion"].lower() and q not in m["responsable"].lower():
+                continue
+            if desde and m["fecha"] < desde:
+                continue
+            if hasta and m["fecha"] > hasta:
+                continue
+            if tipo_sel != "Todos" and m["tipo"] != tipo_sel:
+                continue
+            resultado.append(m)
+        return resultado
+
+    def _render_pagina():
+        for item in tabla_m.get_children():
+            tabla_m.delete(item)
+
+        datos = _filtrados()
+        total_filtrado = len(datos)
+        inicio = estado_paginacion["pagina"] * POR_PAGINA
+        pagina_datos = datos[inicio: inicio + POR_PAGINA]
+
+        for m in pagina_datos:
+            desc_corta = m["descripcion"] if len(m["descripcion"]) <= 38 else m["descripcion"][:37] + "…"
+            tabla_m.insert("", "end", iid=str(m["id"]), tags=(TAG_POR_TIPO_MANT.get(m["tipo"], ""),),
+                          values=(_mant_fecha_legible(m["fecha"]), m["equipo"], m["tipo"], desc_corta,
+                                  m["responsable"], f"{m['horometro']:.0f}", _mant_fecha_legible(m["proximo"]),
+                                  m["estado"], "👁 Ver  📄 PDF"))
+
+        if total_filtrado == 0:
+            lbl_pie_m.config(text="No hay registros que coincidan con los filtros.")
+        else:
+            lbl_pie_m.config(
+                text=f"Mostrando {inicio + 1}-{min(inicio + POR_PAGINA, total_filtrado)} de {total_filtrado} registros")
+
+    def _pagina_anterior():
+        if estado_paginacion["pagina"] > 0:
+            estado_paginacion["pagina"] -= 1
+            _render_pagina()
+
+    def _pagina_siguiente():
+        total_filtrado = len(_filtrados())
+        if (estado_paginacion["pagina"] + 1) * POR_PAGINA < total_filtrado:
+            estado_paginacion["pagina"] += 1
+            _render_pagina()
+
+    tk.Button(fila_pie, text="←", command=_pagina_anterior, bg="#f1f5f9", fg=COLOR_TEXTO,
+             font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=8,
+             pady=2).pack(side="right", padx=(4, 0))
+    tk.Button(fila_pie, text="→", command=_pagina_siguiente, bg="#f1f5f9", fg=COLOR_TEXTO,
+             font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=8,
+             pady=2).pack(side="right")
+
+    def limpiar_filtros_m():
+        e_buscar_m.delete(0, "end")
+        e_desde_m.delete(0, "end")
+        e_hasta_m.delete(0, "end")
+        cb_filtro_tipo_m.set("Todos")
+        refrescar_tabla_m()
+
+    def _clic_tabla_m(evento):
+        fila_id = tabla_m.identify_row(evento.y)
+        columna = tabla_m.identify_column(evento.x)
+        if not fila_id:
+            return
+        m = next((x for x in MANTENIMIENTOS_HISTORIAL if str(x["id"]) == fila_id), None)
+        if not m:
+            return
+        if columna == f"#{len(cols_m)}":   # columna "Acción": decide Ver o PDF según dónde se hizo clic
+            x_rel = evento.x - sum(anchos_m[c] for c in cols_m[:-1])
+            if x_rel > anchos_m["Acción"] * 0.55:
+                _mant_exportar_texto(m)
+                return
+        _ver_detalle_mantenimiento(m)
+
+    def _ver_detalle_mantenimiento(m):
+        ventana_modal = tk.Toplevel(ventana)
+        ventana_modal.title("Detalle del mantenimiento")
+        ventana_modal.configure(bg=COLOR_PANEL)
+        ventana_modal.geometry("460x480")
+        ventana_modal.transient(ventana)
+        ventana_modal.grab_set()
+
+        tk.Label(ventana_modal, text="🔧 Detalle del mantenimiento", font=("Segoe UI Semibold", 11),
+                bg=COLOR_PANEL, fg=COLOR_MARCA).pack(anchor="w", padx=22, pady=(20, 14))
+
+        def fila_dato(etiqueta, valor):
+            f = tk.Frame(ventana_modal, bg=COLOR_PANEL)
+            f.pack(fill="x", padx=22, pady=3)
+            tk.Label(f, text=etiqueta, font=("Segoe UI", 8), bg=COLOR_PANEL,
+                    fg=COLOR_SUAVE).pack(anchor="w")
+            tk.Label(f, text=valor, font=FUENTE_BASE, bg=COLOR_PANEL, fg=COLOR_TEXTO,
+                    wraplength=400, justify="left").pack(anchor="w")
+
+        fila_dato("FECHA", _mant_fecha_legible(m["fecha"]))
+        fila_dato("EQUIPO", m["equipo"])
+        fila_dato("TIPO / PRIORIDAD", f"{m['tipo']} · {m['prioridad']}")
+        fila_dato("RESPONSABLE", m["responsable"])
+        fila_dato("HORÓMETRO", f"{m['horometro']:.0f} h")
+        fila_dato("DESCRIPCIÓN DE ACTIVIDAD", m["descripcion"])
+        fila_dato("REPUESTOS USADOS", m["repuestos"] or "—")
+        fila_dato("TIEMPO EMPLEADO", f"{m['tiempo_horas']} h")
+        fila_dato("PRÓXIMO MANTENIMIENTO", _mant_fecha_legible(m["proximo"]))
+        fila_dato("ESTADO", m["estado"])
+
+        tk.Button(ventana_modal, text="📄 Exportar registro (.txt)",
+                 command=lambda: _mant_exportar_texto(m), bg=COLOR_MARCA, fg="white",
+                 font=FUENTE_FUERTE, relief="flat", bd=0, cursor="hand2", pady=10,
+                 activebackground=COLOR_MARCA_HOVER, activeforeground="white"
+                 ).pack(fill="x", padx=22, pady=(16, 20))
+
+    e_buscar_m.bind("<KeyRelease>", refrescar_tabla_m)
+    e_desde_m.bind("<KeyRelease>", refrescar_tabla_m)
+    e_hasta_m.bind("<KeyRelease>", refrescar_tabla_m)
+    cb_filtro_tipo_m.bind("<<ComboboxSelected>>", refrescar_tabla_m)
+    btn_limpiar_m.config(command=limpiar_filtros_m)
+    tabla_m.bind("<Button-1>", _clic_tabla_m)
+
+    refrescar_tabla_m()
+    estado(f"{len(MANTENIMIENTOS_HISTORIAL)} mantenimientos registrados.")
+
+
+def abrir_imagenes():
+    cuerpo = panel("Archivo de evidencias", "Fotografías de soporte de la operación")
+    lbl = tk.Label(cuerpo, text="Ningún archivo seleccionado.", font=FUENTE_BASE,
+                   bg=COLOR_PANEL, fg=COLOR_SUAVE)
+    lbl.pack(anchor="w", pady=(0, 14))
+
+    def cargar():
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar evidencia",
+            filetypes=[("Imágenes", "*.png *.jpg *.jpeg"), ("Todos", "*.*")])
+        if ruta:
+            lbl.config(text=f"Vinculado: {ruta}", fg=COLOR_OK)
+            estado("Evidencia vinculada.")
+
+    boton_accion(cuerpo, "Seleccionar fotografía", cargar, color="#4a5568", anchor="w")
+
+
+def abrir_dosificacion():
+    cuerpo = panel("Dosificación de tanques", "Capacidad 60 L equivalente a 60 cm de columna")
+    tk.Label(cuerpo, text="Proporción de preparación:  35 L de agua + 25 L de coagulante = 60 L",
+             font=FUENTE_SUB, bg="#ebf4ff", fg=COLOR_ACENTO,
+             padx=12, pady=8).pack(fill="x", pady=(0, 6))
+
+    e1 = campo(cuerpo, "NIVEL INICIAL (CM)", "60", 14)
+    e2 = campo(cuerpo, "NIVEL FINAL (CM)", "35", 14)
+
+    lbl = tk.Label(cuerpo, text="Consumo: —", font=("Segoe UI Semibold", 11),
+                   bg=COLOR_PANEL, fg=COLOR_ACENTO)
+    lbl.pack(anchor="w", pady=16)
+
+    def calcular():
+        try:
+            ini = a_float(e1, "Nivel inicial")
+            fin = a_float(e2, "Nivel final")
+        except ValueError as err:
+            messagebox.showerror("Dato inválido", str(err))
+            return
+        if fin > ini:
+            messagebox.showwarning("Revise los niveles",
+                                   "El nivel final no puede ser mayor que el inicial.")
+            return
+        consumo = ini - fin                    # 1 cm = 1 L en este tanque
+        lbl.config(text=f"Consumo real: {consumo:.2f} litros")
+        estado(f"Balance calculado: {consumo:.2f} L")
+
+    def guardar_dosificacion():
+        try:
+            ini = a_float(e1, "Nivel inicial")
+            fin = a_float(e2, "Nivel final")
+        except ValueError as err:
+            messagebox.showerror("Dato inválido", str(err)); return
+        if fin > ini:
+            messagebox.showwarning("Revise los niveles", "El nivel final no puede ser mayor que el inicial."); return
+        consumo = ini - fin
+        ahora = datetime.datetime.now()
+        guardar_dosificacion_bd(
+            ahora.strftime("%Y-%m-%d"), ahora.strftime("%H:%M"), "Tanque de dosificación",
+            "Coagulante", ini, fin, consumo, OPERADOR_ACTUAL, "Balance manual"
+        )
+        calcular()
+        estado(f"Dosificación guardada: {consumo:.2f} L")
+        messagebox.showinfo("Guardado", "El balance de dosificación quedó almacenado en la base de datos.")
+
+    boton_accion(cuerpo, "Calcular balance", calcular, anchor="w")
+    boton_accion(cuerpo, "Guardar registro", guardar_dosificacion, anchor="w", pady=(6, 0))
+
+
+# ---- Configuración del módulo de Novedades (multi-WhatsApp + historial en memoria)
+CONTACTOS_WHATSAPP = [
+    {"nombre": "Jefe de planta",   "visible": "318 265 12 61", "url": "573182651261"},
+    {"nombre": "Mantenimiento",    "visible": "310 987 65 43", "url": "573109876543"},
+    {"nombre": "Operador de turno","visible": "300 123 45 67", "url": "573001234567"},
+]
+OPERADOR_ACTUAL = "Operador de turno"
+
+TIPOS_NOVEDAD = ["Falla de equipo", "Mantenimiento", "Operativa",
+                  "Parada de planta", "Otra"]
+
+TAG_POR_TIPO = {
+    "Falla de equipo":  "t_falla",
+    "Mantenimiento":    "t_mant",
+    "Operativa":        "t_oper",
+    "Parada de planta": "t_parada",
+    "Otra":             "t_otra",
+}
+
+# id descendente = más reciente primero
+NOVEDADES_HISTORIAL = [
+    {"id": 4, "fecha": "2026-09-23", "hora": "14:21", "tipo": "Falla de equipo",
+     "descripcion": "Se dañó bomba dosificadora #2",
+     "enviado_a": "318 265 12 61, 310 987 65 43", "estado": "Enviado", "operador": OPERADOR_ACTUAL},
+    {"id": 3, "fecha": "2026-09-23", "hora": "12:05", "tipo": "Mantenimiento",
+     "descripcion": "Mantenimiento preventivo en soplante aireación",
+     "enviado_a": "318 265 12 61", "estado": "Enviado", "operador": OPERADOR_ACTUAL},
+    {"id": 2, "fecha": "2026-09-23", "hora": "09:43", "tipo": "Operativa",
+     "descripcion": "Nivel de cloro fuera de rango",
+     "enviado_a": "318 265 12 61", "estado": "Leído", "operador": OPERADOR_ACTUAL},
+    {"id": 1, "fecha": "2026-09-22", "hora": "18:30", "tipo": "Falla de equipo",
+     "descripcion": "Sensor de caudal sin señal",
+     "enviado_a": "318 265 12 61", "estado": "Leído", "operador": OPERADOR_ACTUAL},
+]
+
+
+def _novedad_fecha_legible(fecha_iso):
+    a, m, d = fecha_iso.split("-")
+    return f"{d}/{m}/{a}"
+
+
+def _novedad_fecha_a_iso(texto):
+    """'23/09/2026' -> '2026-09-23'  (None si el texto no es una fecha válida)"""
+    try:
+        return datetime.datetime.strptime(texto.strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return None
+
+
+def construir_mensaje_whatsapp(fecha_legible, hora, operador, tipo, descripcion):
+    return (
+        "*PTAR BELLAVISTA - REPORTE DE NOVEDAD* 🚨\n"
+        f"📅 Fecha: {fecha_legible}\n"
+        f"⏰ Hora: {hora}\n"
+        f"👷 Operador: {operador}\n"
+        f"🔧 Tipo: {tipo}\n"
+        f"📝 Novedad: {descripcion}\n"
+        "_Reporte generado desde Consola SCADA Lite_"
+    )
+
+
+def construir_url_whatsapp(numero_url, mensaje):
+    return f"https://wa.me/{numero_url}?text={urllib.parse.quote(mensaje)}"
+
+
+def _digitos_de(texto):
+    return "".join(filter(str.isdigit, texto))
+
+
+def _numero_url_desde_visible(numero_visible):
+    """'318 265 12 61' -> '573182651261' (agrega el 57 si hace falta)"""
+    digitos = _digitos_de(numero_visible)
+    if len(digitos) < 10:
+        return None
+    if digitos.startswith("57") and len(digitos) > 10:
+        return digitos
+    return "57" + digitos[-10:]
+
+
+def abrir_novedades():
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="x", padx=18, pady=12)
+
+    encabezado_fila = tk.Frame(cont, bg=COLOR_FONDO)
+    encabezado_fila.pack(fill="x")
+    tk.Label(encabezado_fila, text="Novedades de planta", font=FUENTE_TITULO,
+             bg=COLOR_FONDO, fg=COLOR_MARCA).pack(side="left", anchor="w")
+    tk.Label(cont, text="Registro y seguimiento de novedades operativas",
+             font=FUENTE_SUB, bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(2, 10))
+
+    # ============================================================ TARJETA A
+    tarjeta_a = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE,
+                         highlightthickness=1)
+    tarjeta_a.pack(fill="x", pady=(0, 8))
+    cuerpo_a = tk.Frame(tarjeta_a, bg=COLOR_PANEL)
+    cuerpo_a.pack(fill="x", padx=14, pady=10)
+
+    tit_a = tk.Frame(cuerpo_a, bg=COLOR_PANEL)
+    tit_a.pack(anchor="w", pady=(0, 10))
+    tk.Label(tit_a, text="➕", font=("Segoe UI", 11), bg=COLOR_PANEL,
+             fg=COLOR_OK).pack(side="left")
+    tk.Label(tit_a, text=" Registrar nueva novedad", font=("Segoe UI Semibold", 10),
+             bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(side="left")
+
+    tk.Label(cuerpo_a, text="TIPO DE NOVEDAD", font=("Segoe UI", 8),
+             bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(anchor="w")
+    cb_tipo = ttk.Combobox(cuerpo_a, state="readonly", values=TIPOS_NOVEDAD,
+                           font=("Segoe UI", 8))
+    cb_tipo.current(0)
+    cb_tipo.pack(anchor="w", fill="x", pady=(2, 10))
+
+    tk.Label(cuerpo_a, text="DESCRIPCIÓN", font=("Segoe UI", 8),
+             bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(anchor="w")
+    txt_desc = tk.Text(cuerpo_a, height=2, font=("Segoe UI", 8), relief="flat", bg="#f7f9fc",
+                       highlightbackground=COLOR_BORDE, highlightthickness=1,
+                       wrap="word", padx=8, pady=6)
+    txt_desc.pack(fill="x", pady=(2, 3))
+
+    marcador = "Describa la novedad observada... Ej: Se dañó bomba dosificadora #2"
+
+    def _placeholder_activo():
+        return txt_desc.get("1.0", "end").strip() == marcador
+
+    def _poner_placeholder():
+        txt_desc.delete("1.0", "end")
+        txt_desc.insert("1.0", marcador)
+        txt_desc.config(fg=COLOR_SUAVE)
+
+    def _al_enfocar(_e):
+        if _placeholder_activo():
+            txt_desc.delete("1.0", "end")
+            txt_desc.config(fg=COLOR_TEXTO)
+
+    def _al_desenfocar(_e):
+        if not txt_desc.get("1.0", "end").strip():
+            _poner_placeholder()
+
+    _poner_placeholder()
+    txt_desc.bind("<FocusIn>", _al_enfocar)
+    txt_desc.bind("<FocusOut>", _al_desenfocar)
+
+    # ---- Selector de contactos (multi-WhatsApp)
+    marco_contactos = tk.LabelFrame(
+        cuerpo_a, text=" Enviar a (puede seleccionar varios) ", font=("Segoe UI", 8, "bold"),
+        bg=COLOR_PANEL, fg=COLOR_MARCA, padx=10, pady=8)
+    marco_contactos.pack(fill="x", pady=(8, 8))
+
+    checks_contactos = []  # lista de (BooleanVar, contacto_dict)
+
+    def _fila_contacto(contacto, nuevo=False):
+        var = tk.BooleanVar(value=True)
+        chk = tk.Checkbutton(
+            marco_contactos, text=f"📲 {contacto['nombre']} · {contacto['visible']}" + (" (nuevo)" if nuevo else ""),
+            variable=var, bg=COLOR_PANEL, font=("Segoe UI", 8), anchor="w",
+            fg=(COLOR_OK if nuevo else COLOR_TEXTO), selectcolor=COLOR_PANEL)
+        chk.pack(anchor="w", before=fila_agregar)
+        checks_contactos.append((var, contacto))
+
+    fila_agregar = tk.Frame(marco_contactos, bg=COLOR_PANEL)
+    fila_agregar.pack(fill="x", pady=(6, 0))
+
+    for contacto in CONTACTOS_WHATSAPP:
+        _fila_contacto(contacto)
+
+    e_nuevo_num = ttk.Entry(fila_agregar, width=16, font=("Segoe UI", 8))
+    e_nuevo_num.pack(side="left", padx=(0, 6))
+    e_nuevo_num.insert(0, "Ej: 320 111 22 33")
+
+    def _al_enfocar_num(_e):
+        if e_nuevo_num.get() == "Ej: 320 111 22 33":
+            e_nuevo_num.delete(0, "end")
+
+    e_nuevo_num.bind("<FocusIn>", _al_enfocar_num)
+
+    def agregar_contacto_temporal():
+        numero_url = _numero_url_desde_visible(e_nuevo_num.get())
+        if not numero_url:
+            lbl_error_a.config(text="Ingrese un número válido de 10 dígitos (ej: 320 111 22 33).")
+            return
+        lbl_error_a.config(text="")
+        digitos = numero_url[-10:]
+        visible = f"{digitos[0:3]} {digitos[3:6]} {digitos[6:8]} {digitos[8:10]}"
+        nuevo = {"nombre": f"Contacto {len(CONTACTOS_WHATSAPP) + 1}", "visible": visible, "url": numero_url}
+        CONTACTOS_WHATSAPP.append(nuevo)
+        _fila_contacto(nuevo, nuevo=True)
+        e_nuevo_num.delete(0, "end")
+
+    tk.Button(fila_agregar, text="+ Agregar número", command=agregar_contacto_temporal,
+             bg="#e2e8f0", fg=COLOR_TEXTO, font=("Segoe UI", 8, "bold"), relief="flat",
+             cursor="hand2", padx=10, pady=4).pack(side="left")
+
+    lbl_error_a = tk.Label(cuerpo_a, text="", font=("Segoe UI", 8),
+                           bg=COLOR_PANEL, fg=COLOR_ALERTA)
+    lbl_error_a.pack(anchor="w")
+
+    def enviar_por_whatsapp():
+        tipo = cb_tipo.get()
+        descripcion = "" if _placeholder_activo() else txt_desc.get("1.0", "end").strip()
+        if not descripcion:
+            lbl_error_a.config(text="Escriba la descripción de la novedad antes de enviarla.")
+            return
+        seleccionados = [c for var, c in checks_contactos if var.get()]
+        if not seleccionados:
+            lbl_error_a.config(text="Seleccione al menos un número para enviar la novedad.")
+            return
+        lbl_error_a.config(text="")
+
+        ahora = datetime.datetime.now()
+        fecha_iso = ahora.strftime("%Y-%m-%d")
+        hora = ahora.strftime("%H:%M")
+        nuevo_id = (max((n["id"] for n in NOVEDADES_HISTORIAL), default=0)) + 1
+        enviados_str = ", ".join(c["visible"] for c in seleccionados)
+
+        NOVEDADES_HISTORIAL.insert(0, {
+            "id": nuevo_id, "fecha": fecha_iso, "hora": hora, "tipo": tipo,
+            "descripcion": descripcion, "enviado_a": enviados_str,
+            "estado": "Enviado", "operador": OPERADOR_ACTUAL,
+        })
+
+        guardar_novedad_bd({
+            "fecha": fecha_iso, "hora": hora, "tipo": tipo, "descripcion": descripcion,
+            "enviado_a": enviados_str, "estado": "Enviado", "operador": OPERADOR_ACTUAL
+        })
+
+        mensaje = construir_mensaje_whatsapp(
+            _novedad_fecha_legible(fecha_iso), hora, OPERADOR_ACTUAL, tipo, descripcion)
+        for contacto in seleccionados:
+            webbrowser.open(construir_url_whatsapp(contacto["url"], mensaje))
+            time.sleep(0.8)   # evita que el navegador sature al abrir varias pestañas de golpe
+
+        estado(f"Novedad enviada por WhatsApp a: {enviados_str}")
+        abrir_novedades()   # refresca el módulo: limpia el formulario y actualiza la tabla
+
+    btn_enviar = tk.Button(
+        cuerpo_a, text="📲  Enviar novedad por WhatsApp a los contactos seleccionados",
+        command=enviar_por_whatsapp, bg="#16a34a", fg="white", font=("Segoe UI Semibold", 10),
+        relief="flat", bd=0, cursor="hand2", pady=9,
+        activebackground="#15803d", activeforeground="white")
+    btn_enviar.pack(fill="x", pady=(8, 0))
+    btn_enviar.bind("<Enter>", lambda e: btn_enviar.config(bg="#15803d"))
+    btn_enviar.bind("<Leave>", lambda e: btn_enviar.config(bg="#16a34a"))
+
+    # ============================================================ TARJETA B
+    tarjeta_b = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE,
+                         highlightthickness=1)
+    tarjeta_b.pack(fill="both", expand=True)
+    cuerpo_b = tk.Frame(tarjeta_b, bg=COLOR_PANEL)
+    cuerpo_b.pack(fill="both", expand=True, padx=18, pady=14)
+
+    cab_b = tk.Frame(cuerpo_b, bg=COLOR_PANEL)
+    cab_b.pack(fill="x")
+    tk.Label(cab_b, text="🕘  Historial de novedades enviadas", font=("Segoe UI Semibold", 10),
+             bg=COLOR_PANEL, fg=COLOR_TEXTO).pack(side="left")
+    lbl_badge_total = tk.Label(cab_b, font=("Segoe UI", 8, "bold"),
+                               bg="#fde8e3", fg="#c2410c", padx=8, pady=2)
+    lbl_badge_total.pack(side="right")
+
+    # ---- Filtros
+    filtros = tk.Frame(cuerpo_b, bg=COLOR_PANEL)
+    filtros.pack(fill="x", pady=(10, 4))
+
+    def _bloque_filtro(padre, etiqueta, ancho=16):
+        f = tk.Frame(padre, bg=COLOR_PANEL)
+        f.pack(side="left", padx=(0, 8))
+        tk.Label(f, text=etiqueta, font=("Segoe UI", 7), bg=COLOR_PANEL,
+                 fg=COLOR_SUAVE).pack(anchor="w")
+        e = ttk.Entry(f, width=ancho, font=("Segoe UI", 8))
+        e.pack()
+        return e
+
+    e_buscar = _bloque_filtro(filtros, "BUSCAR", 16)
+    e_desde  = _bloque_filtro(filtros, "DESDE (DD/MM/AAAA)", 12)
+    e_hasta  = _bloque_filtro(filtros, "HASTA (DD/MM/AAAA)", 12)
+
+    f_tipo = tk.Frame(filtros, bg=COLOR_PANEL)
+    f_tipo.pack(side="left", padx=(0, 8))
+    tk.Label(f_tipo, text="TIPO", font=("Segoe UI", 7), bg=COLOR_PANEL,
+             fg=COLOR_SUAVE).pack(anchor="w")
+    cb_filtro_tipo = ttk.Combobox(f_tipo, state="readonly", width=14, font=("Segoe UI", 8),
+                                  values=["Todos"] + TIPOS_NOVEDAD)
+    cb_filtro_tipo.set("Todos")
+    cb_filtro_tipo.pack()
+
+    btn_limpiar = tk.Button(filtros, text="⟲ Limpiar", bg="#f1f5f9", fg=COLOR_TEXTO,
+                            font=("Segoe UI", 8), relief="flat", bd=0, cursor="hand2",
+                            padx=10, pady=5)
+    btn_limpiar.pack(side="left", anchor="s")
+
+    # ---- Tabla
+    marco_tabla = tk.Frame(cuerpo_b, bg=COLOR_PANEL)
+    marco_tabla.pack(fill="both", expand=True, pady=(10, 4))
+
+    cols = ("Fecha", "Hora", "Tipo", "Novedad", "Enviado a", "Estado", "Acción")
+    tabla = ttk.Treeview(marco_tabla, columns=cols, show="headings", height=5)
+    scroll_v = ttk.Scrollbar(marco_tabla, orient="vertical", command=tabla.yview)
+    tabla.configure(yscrollcommand=scroll_v.set)
+    tabla.pack(side="left", fill="both", expand=True)
+    scroll_v.pack(side="right", fill="y")
+
+    anchos = {"Fecha": 82, "Hora": 55, "Tipo": 120, "Novedad": 220,
+              "Enviado a": 175, "Estado": 90, "Acción": 65}
+    for col in cols:
+        tabla.heading(col, text=col)
+        tabla.column(col, width=anchos[col],
+                    anchor="w" if col in ("Novedad", "Enviado a") else "center")
+
+    for tag, color in (("t_falla", "#fef2f2"), ("t_mant", "#eff6ff"), ("t_oper", "#f5f3ff"),
+                       ("t_parada", "#fff7ed"), ("t_otra", "#f8fafc")):
+        tabla.tag_configure(tag, background=color)
+
+    lbl_pie = tk.Label(cuerpo_b, font=("Segoe UI", 8), bg=COLOR_PANEL, fg=COLOR_SUAVE)
+    lbl_pie.pack(anchor="w", pady=(4, 0))
+
+    def refrescar_tabla(_evento=None):
+        q = e_buscar.get().strip().lower()
+        desde = _novedad_fecha_a_iso(e_desde.get())
+        hasta = _novedad_fecha_a_iso(e_hasta.get())
+        tipo_sel = cb_filtro_tipo.get()
+
+        for item in tabla.get_children():
+            tabla.delete(item)
+
+        visibles = 0
+        for n in NOVEDADES_HISTORIAL:
+            if q and q not in n["descripcion"].lower():
+                continue
+            if desde and n["fecha"] < desde:
+                continue
+            if hasta and n["fecha"] > hasta:
+                continue
+            if tipo_sel != "Todos" and n["tipo"] != tipo_sel:
+                continue
+
+            desc_corta = n["descripcion"] if len(n["descripcion"]) <= 46 else n["descripcion"][:45] + "…"
+            marca_estado = "✔ Enviado" if n["estado"] == "Enviado" else "✔✔ Leído"
+            tabla.insert("", "end", iid=str(n["id"]), tags=(TAG_POR_TIPO.get(n["tipo"], "t_otra"),),
+                        values=(_novedad_fecha_legible(n["fecha"]), n["hora"], n["tipo"],
+                                desc_corta, "📲 " + n["enviado_a"], marca_estado, "👁 Ver"))
+            visibles += 1
+
+        lbl_pie.config(text=f"Mostrando {visibles} de {len(NOVEDADES_HISTORIAL)} resultados")
+        lbl_badge_total.config(text=f"{len(NOVEDADES_HISTORIAL)} registros")
+
+    def limpiar_filtros():
+        e_buscar.delete(0, "end")
+        e_desde.delete(0, "end")
+        e_hasta.delete(0, "end")
+        cb_filtro_tipo.set("Todos")
+        refrescar_tabla()
+
+    def ver_detalle(evento):
+        fila_id = tabla.identify_row(evento.y)
+        if not fila_id:
+            return
+        n = next((x for x in NOVEDADES_HISTORIAL if str(x["id"]) == fila_id), None)
+        if not n:
+            return
+
+        ventana_modal = tk.Toplevel(ventana)
+        ventana_modal.title("Detalle de la novedad")
+        ventana_modal.configure(bg=COLOR_PANEL)
+        ventana_modal.geometry("440x400")
+        ventana_modal.transient(ventana)
+        ventana_modal.grab_set()
+
+        tk.Label(ventana_modal, text="📋 Detalle de la novedad", font=("Segoe UI Semibold", 11),
+                bg=COLOR_PANEL, fg=COLOR_MARCA).pack(anchor="w", padx=22, pady=(20, 14))
+
+        def fila_dato(etiqueta, valor):
+            f = tk.Frame(ventana_modal, bg=COLOR_PANEL)
+            f.pack(fill="x", padx=22, pady=4)
+            tk.Label(f, text=etiqueta, font=("Segoe UI", 8), bg=COLOR_PANEL,
+                    fg=COLOR_SUAVE).pack(anchor="w")
+            tk.Label(f, text=valor, font=FUENTE_BASE, bg=COLOR_PANEL, fg=COLOR_TEXTO,
+                    wraplength=390, justify="left").pack(anchor="w")
+
+        fila_dato("FECHA", _novedad_fecha_legible(n["fecha"]))
+        fila_dato("HORA", n["hora"])
+        fila_dato("TIPO", n["tipo"])
+        fila_dato("OPERADOR", n["operador"])
+        fila_dato("DESCRIPCIÓN COMPLETA", n["descripcion"])
+        fila_dato("ENVIADO A (WHATSAPP)", n["enviado_a"])
+
+        def reenviar():
+            mensaje = construir_mensaje_whatsapp(
+                _novedad_fecha_legible(n["fecha"]), n["hora"], n["operador"], n["tipo"], n["descripcion"])
+            for numero_visible in n["enviado_a"].split(","):
+                numero_url = _numero_url_desde_visible(numero_visible)
+                if numero_url:
+                    webbrowser.open(construir_url_whatsapp(numero_url, mensaje))
+                    time.sleep(0.8)
+
+        btn_reenviar = tk.Button(ventana_modal, text="📲  Reenviar por WhatsApp", command=reenviar,
+                                 bg="#16a34a", fg="white", font=FUENTE_FUERTE, relief="flat",
+                                 bd=0, cursor="hand2", pady=10,
+                                 activebackground="#15803d", activeforeground="white")
+        btn_reenviar.pack(fill="x", padx=22, pady=(16, 20))
+
+    e_buscar.bind("<KeyRelease>", refrescar_tabla)
+    e_desde.bind("<KeyRelease>", refrescar_tabla)
+    e_hasta.bind("<KeyRelease>", refrescar_tabla)
+    cb_filtro_tipo.bind("<<ComboboxSelected>>", refrescar_tabla)
+    btn_limpiar.config(command=limpiar_filtros)
+    tabla.bind("<Button-1>", ver_detalle)
+
+    refrescar_tabla()
+    estado(f"{len(NOVEDADES_HISTORIAL)} novedades registradas.")
+
+
+# ---- Constantes técnicas del tanque de coagulante (dato real, no inventar)
+TANQUE_DIAMETRO_CM = 36
+TANQUE_RADIO_CM = TANQUE_DIAMETRO_CM / 2
+TANQUE_ALTO_CM = 66
+TANQUE_AREA_CM2 = 3.1416 * TANQUE_RADIO_CM ** 2          # 1017.88 cm²
+TANQUE_FACTOR_L_POR_CM = round(TANQUE_AREA_CM2 / 1000, 4)  # 1.0179 L / cm
+TANQUE_CAPACIDAD_L = round(TANQUE_ALTO_CM * TANQUE_FACTOR_L_POR_CM, 2)  # 67.18 L
+
+# Consumo diario en CM medidos por el operador (0 = sin registro ese día)
+CONSUMO_CM_SEPTIEMBRE = [3, 3, 4, 3, 10, 4, 3, 5, 4, 3, 3, 9, 5, 3, 6, 10, 10, 11,
+                        9, 6, 0, 0, 10, 10, 12, 10, 10, 9, 0, 0]
+
+COLOR_NORMAL   = "#22c55e"
+COLOR_MODERADO = "#eab308"
+COLOR_ALTO     = "#ef4444"
+COLOR_SIN_DATO = "#d1d5db"
+
+
+def _clasificar_consumo(litros, cm):
+    if cm == 0:
+        return "Sin registro", COLOR_SIN_DATO
+    if litros <= 6:
+        return "Normal", COLOR_NORMAL
+    if litros <= 9.5:
+        return "Moderado", COLOR_MODERADO
+    return "Alto", COLOR_ALTO
+
+
+def abrir_centro_analitica():
+    """Centro de analítica integrado: KPIs, tendencias e indicadores de gestión."""
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="x", padx=16, pady=10)
+
+    tk.Label(cont, text="Centro de Analítica PTAR", font=("Segoe UI Semibold", 14),
+             bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    tk.Label(cont, text="Indicadores operativos, históricos y seguimiento de la planta",
+             font=("Segoe UI", 8), bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(2, 8))
+
+    filtro = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    filtro.pack(fill="x", pady=(0, 8))
+    fbody = tk.Frame(filtro, bg=COLOR_PANEL)
+    fbody.pack(fill="x", padx=10, pady=8)
+    tk.Label(fbody, text="PERÍODO", font=("Segoe UI Semibold", 8), bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(side="left")
+    desde = ttk.Entry(fbody, width=12, font=FUENTE_BASE)
+    desde.pack(side="left", padx=(7, 4))
+    desde.insert(0, "01/09/2026")
+    tk.Label(fbody, text="a", font=FUENTE_BASE, bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(side="left")
+    hasta = ttk.Entry(fbody, width=12, font=FUENTE_BASE)
+    hasta.pack(side="left", padx=(4, 8))
+    hasta.insert(0, datetime.datetime.now().strftime("%d/%m/%Y"))
+
+    contenido = tk.Frame(cont, bg=COLOR_FONDO)
+    contenido.pack(fill="x")
+
+    def iso(e):
+        try:
+            return datetime.datetime.strptime(e.get().strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    def pintar():
+        fi, ff = iso(desde), iso(hasta)
+        if not fi or not ff or fi > ff:
+            messagebox.showerror("Período inválido", "Use fechas DD/MM/AAAA y verifique el rango.")
+            return
+        for w in contenido.winfo_children():
+            w.destroy()
+
+        ph = db_consultar("SELECT punto, AVG(ph) promedio, MIN(ph) minimo, MAX(ph) maximo, COUNT(*) registros FROM ph_registros WHERE fecha BETWEEN ? AND ? GROUP BY punto", (fi, ff))
+        af = db_consultar("SELECT AVG(caudal_lps) promedio, MIN(caudal_lps) minimo, MAX(caudal_lps) maximo, COUNT(*) registros FROM aforos WHERE fecha BETWEEN ? AND ?", (fi, ff))
+        la = db_consultar("SELECT COUNT(*) total, SUM(CASE WHEN estado='Completado' THEN 1 ELSE 0 END) completados, SUM(CASE WHEN estado='Pendiente' THEN 1 ELSE 0 END) pendientes FROM lavados_unidades WHERE fecha BETWEEN ? AND ?", (fi, ff))[0]
+        ma = db_consultar("SELECT COUNT(*) total, SUM(CASE WHEN estado!='Realizado' THEN 1 ELSE 0 END) pendientes FROM mantenimientos WHERE fecha BETWEEN ? AND ?", (fi, ff))[0]
+        no = db_consultar("SELECT COUNT(*) total FROM novedades WHERE fecha BETWEEN ? AND ?", (fi, ff))[0]
+
+        kpi = tk.Frame(contenido, bg=COLOR_FONDO)
+        kpi.pack(fill="x", pady=(0, 8))
+        pin = next((x for x in ph if x['punto']=='Entrada'), None)
+        pout = next((x for x in ph if x['punto']=='Salida'), None)
+        ca = af[0] if af else {}
+        tarjetas = [
+            ("pH ENTRADA", f"{pin['promedio']:.2f}" if pin else "—", f"{pin['registros']} registros" if pin else "Sin datos", COLOR_MARCA),
+            ("pH SALIDA", f"{pout['promedio']:.2f}" if pout else "—", f"{pout['registros']} registros" if pout else "Sin datos", COLOR_ACENTO),
+            ("CAUDAL PROMEDIO", f"{ca['promedio']:.2f} L/s" if ca.get('promedio') is not None else "—", f"{ca.get('registros',0)} aforos", COLOR_OK),
+            ("LAVADOS", str(la.get('total') or 0), f"{la.get('pendientes') or 0} pendientes", COLOR_ACENTO),
+            ("MANTENIMIENTOS", str(ma.get('total') or 0), f"{ma.get('pendientes') or 0} pendientes", COLOR_ALERTA),
+            ("NOVEDADES", str(no.get('total') or 0), "registradas", COLOR_MARCA),
+        ]
+        for titulo, valor, sub, color in tarjetas:
+            c=tk.Frame(kpi,bg=COLOR_PANEL,highlightbackground=COLOR_BORDE,highlightthickness=1)
+            c.pack(side='left',fill='x',expand=True,padx=(0,6),ipadx=6,ipady=5)
+            tk.Label(c,text=titulo,font=('Segoe UI',7,'bold'),bg=COLOR_PANEL,fg=COLOR_SUAVE).pack(anchor='w',padx=7)
+            tk.Label(c,text=valor,font=('Segoe UI Semibold',13),bg=COLOR_PANEL,fg=color).pack(anchor='w',padx=7)
+            tk.Label(c,text=sub,font=('Segoe UI',7),bg=COLOR_PANEL,fg=COLOR_SUAVE).pack(anchor='w',padx=7)
+
+        fila=tk.Frame(contenido,bg=COLOR_FONDO); fila.pack(fill='x')
+        def tarjeta_grafico(titulo):
+            c=tk.Frame(fila,bg=COLOR_PANEL,highlightbackground=COLOR_BORDE,highlightthickness=1)
+            c.pack(side='left',fill='both',expand=True,padx=(0,6),pady=(0,8))
+            tk.Label(c,text=titulo,font=('Segoe UI Semibold',9),bg=COLOR_PANEL,fg=COLOR_TEXTO).pack(anchor='w',padx=9,pady=(7,2))
+            return c
+
+        if HAY_GRAFICAS:
+            c1=tarjeta_grafico('Evolución de pH')
+            filas=db_consultar("SELECT fecha, AVG(CASE WHEN punto='Entrada' THEN ph END) entrada, AVG(CASE WHEN punto='Salida' THEN ph END) salida FROM ph_registros WHERE fecha BETWEEN ? AND ? GROUP BY fecha ORDER BY fecha",(fi,ff))
+            fig=Figure(figsize=(5.2,2.15),dpi=100,facecolor=COLOR_PANEL); ax=fig.add_subplot(111)
+            if filas:
+                xs=list(range(1,len(filas)+1)); ent=[r['entrada'] for r in filas]; sal=[r['salida'] for r in filas]
+                ax.plot(xs,ent,marker='o',label='Entrada'); ax.plot(xs,sal,marker='o',label='Salida'); ax.legend(fontsize=7); ax.set_ylim(4,10)
+            ax.grid(axis='y',linestyle=':',alpha=.4); ax.tick_params(labelsize=7); fig.tight_layout(); FigureCanvasTkAgg(fig,master=c1).get_tk_widget().pack(fill='x',padx=5,pady=3)
+            c2=tarjeta_grafico('Caudal registrado')
+            filas2=db_consultar("SELECT fecha, AVG(caudal_lps) caudal FROM aforos WHERE fecha BETWEEN ? AND ? GROUP BY fecha ORDER BY fecha",(fi,ff))
+            fig2=Figure(figsize=(5.2,2.15),dpi=100,facecolor=COLOR_PANEL); ax2=fig2.add_subplot(111)
+            if filas2:
+                xs=list(range(1,len(filas2)+1)); ax2.bar(xs,[r['caudal'] for r in filas2],width=.65)
+            ax2.set_ylabel('L/s',fontsize=7); ax2.tick_params(labelsize=7); ax2.grid(axis='y',linestyle=':',alpha=.4); fig2.tight_layout(); FigureCanvasTkAgg(fig2,master=c2).get_tk_widget().pack(fill='x',padx=5,pady=3)
+        else:
+            tk.Label(fila,text='Instale matplotlib para visualizar las gráficas.',font=FUENTE_BASE,bg=COLOR_PANEL,fg=COLOR_SUAVE).pack(pady=30)
+
+        tk.Label(contenido,text='La información de este panel proviene de la base SQLite central del SCADA.',font=('Segoe UI',8),bg=COLOR_FONDO,fg=COLOR_SUAVE).pack(anchor='w',pady=(0,8))
+        estado('Analítica actualizada desde la base de datos.')
+
+    boton_accion(fbody,'Actualizar indicadores',pintar,side='left',padx=(4,0),pady=0)
+    pintar()
+
+
+def abrir_estadisticas():
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="x", padx=18, pady=12)
+
+    tk.Label(cont,
+             text=f"PTAR BELLAVISTA · Consumo coagulante diario "
+                  f"(Tanque Ø{TANQUE_DIAMETRO_CM}cm x {TANQUE_ALTO_CM}cm = {TANQUE_CAPACIDAD_L} L)",
+             font=("Segoe UI Semibold", 13), bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    tk.Label(cont,
+             text=f"1 cm de nivel = {TANQUE_FACTOR_L_POR_CM} L  ·  Septiembre 2026  ·  30 días",
+             font=("Segoe UI", 8), bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(2, 7))
+
+    tarjeta = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    tarjeta.pack(fill="x", pady=(0, 0))
+    cuerpo = tk.Frame(tarjeta, bg=COLOR_PANEL)
+    cuerpo.pack(fill="x", padx=12, pady=10)
+
+    if not HAY_GRAFICAS:
+        tk.Label(cuerpo, text="Instale matplotlib para ver este panel\n(pip install matplotlib)",
+                 font=FUENTE_BASE, bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(pady=50)
+        return
+
+    dias = list(range(1, 31))
+    litros = [round(cm * TANQUE_FACTOR_L_POR_CM, 2) for cm in CONSUMO_CM_SEPTIEMBRE]
+    clasif = [_clasificar_consumo(l, c) for l, c in zip(litros, CONSUMO_CM_SEPTIEMBRE)]
+    colores = [c[1] for c in clasif]
+
+    con_registro = [(d, l, cm) for d, l, cm in zip(dias, litros, CONSUMO_CM_SEPTIEMBRE) if cm > 0]
+    total_mensual = round(sum(l for _, l, _ in con_registro), 2)
+    promedio = round(total_mensual / len(con_registro), 2) if con_registro else 0.0
+    dia_max, litros_max, cm_max = max(con_registro, key=lambda x: x[1])
+    clas_max = _clasificar_consumo(litros_max, cm_max)[0]
+
+    # ---- Leyenda
+    leyenda = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    leyenda.pack(fill="x", pady=(0, 4))
+    for texto, color in (("Normal 3–5 cm (0–6 L)", COLOR_NORMAL),
+                         ("Moderado 6–9 cm (6–9.5 L)", COLOR_MODERADO),
+                         ("Alto 10–12 cm (>9.5 L)", COLOR_ALTO),
+                         ("Sin registro", COLOR_SIN_DATO)):
+        chip = tk.Frame(leyenda, bg=COLOR_PANEL)
+        chip.pack(side="left", padx=(0, 16))
+        tk.Canvas(chip, width=12, height=12, bg=COLOR_PANEL, highlightthickness=0
+                 ).pack(side="left")
+        tk.Canvas(chip, width=12, height=12, bg=color, highlightthickness=0
+                 ).place(in_=chip, x=0, y=2)
+        tk.Label(chip, text=" " + texto, font=("Segoe UI", 8), bg=COLOR_PANEL,
+                 fg=COLOR_SUAVE).pack(side="left")
+    chip_prom = tk.Frame(leyenda, bg=COLOR_PANEL)
+    chip_prom.pack(side="left")
+    tk.Canvas(chip_prom, width=16, height=2, bg=COLOR_ACENTO, highlightthickness=0
+             ).pack(side="left", pady=6)
+    tk.Label(chip_prom, text=f" Promedio {promedio:.2f} L", font=("Segoe UI", 8),
+             bg=COLOR_PANEL, fg=COLOR_ACENTO).pack(side="left")
+
+    # ---- Gráfico
+    fig = Figure(figsize=(9.5, 3.0), dpi=100, facecolor=COLOR_PANEL)
+    ax = fig.add_subplot(111)
+    barras = ax.bar(dias, litros, width=0.62, color=colores, edgecolor="white", linewidth=0.6)
+
+    ax.axhline(promedio, color=COLOR_ACENTO, linestyle="--", linewidth=1.3, zorder=3)
+
+    for x, l, cm in zip(dias, litros, CONSUMO_CM_SEPTIEMBRE):
+        if cm == 0:
+            continue
+        ax.text(x, l + 0.35, f"{cm}cm\n{l:.1f}L", ha="center", va="bottom",
+                fontsize=5.6, color=COLOR_TEXTO, linespacing=1.1)
+
+    ax.set_xlim(0.3, 30.7)
+    ax.set_xticks(dias)
+    ax.set_xticklabels(dias, fontsize=7)
+    ax.set_xlabel("Día del mes (1 al 30)", fontsize=8, color=COLOR_SUAVE)
+    ax.set_ylim(0, 14)
+    ax.set_ylabel("Litros consumidos (L)", fontsize=8, color=COLOR_SUAVE)
+    ax.grid(axis="y", linestyle=":", alpha=0.5)
+    ax.set_axisbelow(True)
+    for lado in ("top", "right"):
+        ax.spines[lado].set_visible(False)
+    ax.tick_params(labelsize=7, colors=COLOR_SUAVE)
+    fig.tight_layout()
+
+    canvas = FigureCanvasTkAgg(fig, master=cuerpo)
+    widget_canvas = canvas.get_tk_widget()
+    widget_canvas.pack(fill="x", expand=False, pady=(3, 0))
+
+    anotacion = ax.annotate("", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
+                            bbox=dict(boxstyle="round,pad=0.4", fc="#111827", ec="none"),
+                            color="white", fontsize=8, visible=False, zorder=10)
+
+    def al_mover(evento):
+        visible = anotacion.get_visible()
+        if evento.inaxes != ax:
+            if visible:
+                anotacion.set_visible(False)
+                canvas.draw_idle()
+            return
+        for barra, x, l, cm, (nombre_clase, _color) in zip(barras, dias, litros,
+                                                            CONSUMO_CM_SEPTIEMBRE, clasif):
+            contiene, _ = barra.contains(evento)
+            if contiene:
+                if cm == 0:
+                    texto = f"Día {x} — sin registro de dosificación."
+                else:
+                    texto = (f"Día {x} — Consumo de {l:.1f} L ({cm}cm) ({nombre_clase}).")
+                    if nombre_clase == "Alto":
+                        texto += "\nRevisar dosificación y verificar calidad del agua."
+                anotacion.xy = (x, l)
+                anotacion.set_text(texto)
+                anotacion.set_visible(True)
+                canvas.draw_idle()
+                return
+        if visible:
+            anotacion.set_visible(False)
+            canvas.draw_idle()
+
+    canvas.mpl_connect("motion_notify_event", al_mover)
+
+    # ---- Tarjetas KPI
+    kpis = tk.Frame(cuerpo, bg=COLOR_PANEL)
+    kpis.pack(fill="x", pady=(8, 0))
+    tarjetas_kpi = [
+        ("TOTAL MENSUAL", f"{total_mensual:.1f} L", "Acumulado de 30 días", COLOR_MARCA),
+        ("PROMEDIO DIARIO", f"{promedio:.1f} L", "Sobre días con registro", COLOR_ACENTO),
+        ("MÁXIMO", f"{litros_max:.1f} L", f"Día {dia_max} · Consumo {clas_max.lower()}",
+         COLOR_ALTO if clas_max == "Alto" else COLOR_MODERADO),
+    ]
+    for titulo, valor, sub, color in tarjetas_kpi:
+        c = tk.Frame(kpis, bg="#f7f9fc", highlightbackground=COLOR_BORDE, highlightthickness=1)
+        c.pack(side="left", padx=(0, 8), ipadx=8, ipady=6, fill="x", expand=True)
+        tk.Label(c, text=titulo, font=("Segoe UI", 8), bg="#f7f9fc",
+                 fg=COLOR_SUAVE).pack(anchor="w")
+        tk.Label(c, text=valor, font=("Segoe UI Semibold", 14), bg="#f7f9fc",
+                 fg=color).pack(anchor="w")
+        tk.Label(c, text=sub, font=("Segoe UI", 8), bg="#f7f9fc",
+                 fg=COLOR_SUAVE).pack(anchor="w")
+
+    estado(f"Consumo total: {total_mensual:.1f} L · Promedio {promedio:.2f} L · "
+           f"Máximo día {dia_max} ({litros_max:.1f} L)")
+
+
+def abrir_operador():
+    cuerpo = panel("Registro de operador", "El nombre activo se asignará a los nuevos registros de pH, aforos, lavados y novedades.")
+    entradas = {}
+    for etiqueta in ("NOMBRES", "APELLIDOS", "CELULAR", "CARGO"):
+        entradas[etiqueta] = campo(cuerpo, etiqueta, "", 34)
+
+    tk.Label(cuerpo, text=f"Operador activo: {OPERADOR_ACTUAL}", font=FUENTE_FUERTE,
+             bg=COLOR_PANEL, fg=COLOR_ACENTO).pack(anchor="w", pady=(10, 0))
+
+    def guardar():
+        global OPERADOR_ACTUAL
+        faltan = [k for k, v in entradas.items() if not v.get().strip()]
+        if faltan:
+            messagebox.showwarning("Campos incompletos",
+                                   "Complete: " + ", ".join(f.capitalize() for f in faltan))
+            return
+        nombre = f"{entradas['NOMBRES'].get().strip()} {entradas['APELLIDOS'].get().strip()}".strip()
+        OPERADOR_ACTUAL = nombre
+        db_ejecutar("INSERT INTO configuracion(clave,valor) VALUES('operador_actual',?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor", (OPERADOR_ACTUAL,))
+        estado(f"Operador activo actualizado: {OPERADOR_ACTUAL}.")
+        messagebox.showinfo("Operador actualizado", f"Los próximos registros quedarán asignados a:\n{OPERADOR_ACTUAL}")
+        abrir_operador()
+
+    boton_accion(cuerpo, "Guardar y activar operador", guardar, anchor="w", pady=(20, 0))
+
+
+# ---- Bitácora de lavado de unidades
+# Los registros se mantienen durante la ejecución de la aplicación.
+LAVADOS_HISTORIAL = [
+    {"fecha": "25/09/2026", "unidad": "Tanque DAF Azul", "estado": "Completado",
+     "tiempo": "2h 15m", "operador": "Operador de turno",
+     "notas": "Lavado de las unidades de mezcla y equipamiento."},
+    {"fecha": "24/09/2026", "unidad": "Homogeneizador 1", "estado": "Completado",
+     "tiempo": "1h 45m", "operador": "Operador de turno",
+     "notas": "Limpieza interna y revisión general."},
+    {"fecha": "24/09/2026", "unidad": "Homogeneizador 2", "estado": "En proceso",
+     "tiempo": "1h 45m", "operador": "Operador de turno",
+     "notas": "Limpieza y retiro de sólidos."},
+    {"fecha": "25/09/2026", "unidad": "Tanque DAF Azul", "estado": "Completado",
+     "tiempo": "2h 15m", "operador": "Operador de turno",
+     "notas": "Lavado de unidades."},
+    {"fecha": "24/09/2026", "unidad": "Homogeneizador 1", "estado": "En proceso",
+     "tiempo": "1h 45m", "operador": "Operador de turno",
+     "notas": "Desincrustación y limpieza."},
+    {"fecha": "24/09/2026", "unidad": "Trampa de Grasas", "estado": "Completado",
+     "tiempo": "1h 45m", "operador": "Operador de turno",
+     "notas": "Lavado y retiro de grasas acumuladas."},
+]
+
+
+# La base de datos es la fuente persistente del historial de lavado.
+try:
+    LAVADOS_HISTORIAL = cargar_lavados_bd()
+except Exception:
+    pass
+
+
+def abrir_actividades():
+    """Bitácora completa de lavado de unidades: registro + historial + filtro."""
+    limpiar()
+
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="x", padx=14, pady=10)
+
+    tk.Label(
+        cont, text="Lavado de unidades",
+        font=("Segoe UI Semibold", 13),
+        bg=COLOR_FONDO, fg=COLOR_MARCA
+    ).pack(anchor="w")
+
+    tk.Label(
+        cont, text="Historial de limpieza por equipo",
+        font=("Segoe UI", 8),
+        bg=COLOR_FONDO, fg=COLOR_SUAVE
+    ).pack(anchor="w", pady=(1, 8))
+
+    # =========================================================
+    # NUEVO REGISTRO
+    # =========================================================
+    tarjeta_registro = tk.Frame(
+        cont, bg=COLOR_PANEL,
+        highlightbackground=COLOR_BORDE, highlightthickness=1
+    )
+    tarjeta_registro.pack(fill="x", pady=(0, 8))
+
+    registro = tk.Frame(tarjeta_registro, bg=COLOR_PANEL)
+    registro.pack(fill="x", padx=12, pady=10)
+
+    tk.Label(
+        registro, text="NUEVO REGISTRO",
+        font=("Segoe UI Semibold", 11),
+        bg=COLOR_PANEL, fg=COLOR_TEXTO
+    ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+    def etiqueta(parent, texto, row, col):
+        tk.Label(
+            parent, text=texto,
+            font=("Segoe UI", 8),
+            bg=COLOR_PANEL, fg=COLOR_SUAVE
+        ).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=(0, 3))
+
+    etiqueta(registro, "UNIDAD INTERVENIDA", 1, 0)
+    etiqueta(registro, "FECHA DEL LAVADO", 1, 1)
+    etiqueta(registro, "ESTADO", 1, 2)
+    etiqueta(registro, "TIEMPO", 1, 3)
+
+    unidades = [
+        "Tanque DAF Azul", "Homogeneizador 1", "Homogeneizador 2",
+        "Trampa de Grasas", "Lecho de Secado", "Tanque Cónico Piso"
+    ]
+
+    cb_unidad = ttk.Combobox(
+        registro, state="readonly", values=unidades,
+        font=FUENTE_BASE, width=27
+    )
+    cb_unidad.grid(row=2, column=0, sticky="ew", padx=(0, 8))
+    cb_unidad.current(0)
+
+    e_fecha = ttk.Entry(registro, font=FUENTE_BASE, width=17)
+    e_fecha.grid(row=2, column=1, sticky="ew", padx=(0, 8))
+    e_fecha.insert(0, datetime.datetime.now().strftime("%d/%m/%Y"))
+
+    cb_estado_lavado = ttk.Combobox(
+        registro, state="readonly",
+        values=["Completado", "En proceso", "Pendiente"],
+        font=FUENTE_BASE, width=16
+    )
+    cb_estado_lavado.grid(row=2, column=2, sticky="ew", padx=(0, 8))
+    cb_estado_lavado.current(0)
+
+    e_tiempo = ttk.Entry(registro, font=FUENTE_BASE, width=14)
+    e_tiempo.grid(row=2, column=3, sticky="ew")
+    e_tiempo.insert(0, "1h 30m")
+
+    etiqueta(registro, "OPERADOR", 3, 0)
+    etiqueta(registro, "NOTAS / ACTIVIDAD REALIZADA", 3, 1)
+
+    e_operador = ttk.Entry(registro, font=FUENTE_BASE, width=27)
+    e_operador.grid(row=4, column=0, sticky="ew", padx=(0, 8))
+    e_operador.insert(0, OPERADOR_ACTUAL)
+
+    e_notas = ttk.Entry(registro, font=FUENTE_BASE, width=48)
+    e_notas.grid(row=4, column=1, columnspan=3, sticky="ew")
+
+    for col, weight in enumerate((2, 1, 1, 1)):
+        registro.grid_columnconfigure(col, weight=weight)
+
+    botones_registro = tk.Frame(registro, bg=COLOR_PANEL)
+    botones_registro.grid(row=5, column=0, columnspan=4, sticky="w", pady=(9, 0))
+
+    # =========================================================
+    # HISTORIAL
+    # =========================================================
+    tarjeta_historial = tk.Frame(
+        cont, bg=COLOR_PANEL,
+        highlightbackground=COLOR_BORDE, highlightthickness=1
+    )
+    tarjeta_historial.pack(fill="both", expand=True)
+
+    historial = tk.Frame(tarjeta_historial, bg=COLOR_PANEL)
+    historial.pack(fill="both", expand=True, padx=12, pady=10)
+
+    fila_titulo = tk.Frame(historial, bg=COLOR_PANEL)
+    fila_titulo.pack(fill="x", pady=(0, 7))
+
+    tk.Label(
+        fila_titulo, text="Historial de limpieza",
+        font=("Segoe UI Semibold", 11),
+        bg=COLOR_PANEL, fg=COLOR_TEXTO
+    ).pack(side="left")
+
+    filtro_var = tk.StringVar()
+    e_filtro = ttk.Entry(
+        fila_titulo, textvariable=filtro_var,
+        font=("Segoe UI", 9), width=28
+    )
+    e_filtro.pack(side="right", padx=(6, 0))
+
+    tk.Label(
+        fila_titulo, text="Filtro:",
+        font=("Segoe UI", 8),
+        bg=COLOR_PANEL, fg=COLOR_SUAVE
+    ).pack(side="right")
+
+    marco_tabla = tk.Frame(historial, bg=COLOR_PANEL)
+    marco_tabla.pack(fill="both", expand=True)
+
+    columnas = ("FECHA", "UNIDAD", "ESTADO", "TIEMPO", "OPERADOR", "NOTAS")
+    tabla = ttk.Treeview(
+        marco_tabla, columns=columnas, show="headings",
+        height=10, selectmode="browse"
+    )
+
+    anchos = {
+        "FECHA": 95,
+        "UNIDAD": 175,
+        "ESTADO": 105,
+        "TIEMPO": 90,
+        "OPERADOR": 135,
+        "NOTAS": 330,
+    }
+
+    for col in columnas:
+        tabla.heading(col, text=col)
+        tabla.column(
+            col, width=anchos[col],
+            minwidth=70,
+            anchor="w" if col in ("UNIDAD", "OPERADOR", "NOTAS") else "center",
+            stretch=True if col == "NOTAS" else False
+        )
+
+    scroll_y = ttk.Scrollbar(
+        marco_tabla, orient="vertical", command=tabla.yview
+    )
+    scroll_x = ttk.Scrollbar(
+        marco_tabla, orient="horizontal", command=tabla.xview
+    )
+    tabla.configure(
+        yscrollcommand=scroll_y.set,
+        xscrollcommand=scroll_x.set
+    )
+
+    tabla.grid(row=0, column=0, sticky="nsew")
+    scroll_y.grid(row=0, column=1, sticky="ns")
+    scroll_x.grid(row=1, column=0, sticky="ew")
+
+    marco_tabla.grid_rowconfigure(0, weight=1)
+    marco_tabla.grid_columnconfigure(0, weight=1)
+
+    tabla.tag_configure("par", background="#f7f9fc")
+    tabla.tag_configure("completado", foreground="#166534")
+    tabla.tag_configure("proceso", foreground="#1d4ed8")
+    tabla.tag_configure("pendiente", foreground="#b91c1c")
+
+    seleccion_id = {"indice": None}
+
+    def cargar_tabla():
+        """Recarga desde SQLite y refresca el historial aplicando el filtro."""
+        global LAVADOS_HISTORIAL
+        LAVADOS_HISTORIAL = cargar_lavados_bd()
+        for item in tabla.get_children():
+            tabla.delete(item)
+
+        filtro = filtro_var.get().strip().lower()
+
+        for indice, r in enumerate(LAVADOS_HISTORIAL):
+            texto = " ".join(str(r.get(k, "")) for k in
+                             ("fecha", "unidad", "estado", "tiempo", "operador", "notas"))
+            if filtro and filtro not in texto.lower():
+                continue
+
+            estado_reg = r.get("estado", "")
+            if estado_reg == "Completado":
+                tag_estado = "completado"
+            elif estado_reg == "En proceso":
+                tag_estado = "proceso"
+            else:
+                tag_estado = "pendiente"
+
+            tags = [tag_estado]
+            if len(tabla.get_children()) % 2 == 0:
+                tags.append("par")
+
+            tabla.insert(
+                "", "end", iid=str(r.get("id", indice)),
+                values=(
+                    _fecha_para_mostrar(r.get("fecha", "")),
+                    r.get("unidad", ""),
+                    r.get("estado", ""),
+                    r.get("tiempo", ""),
+                    r.get("operador", ""),
+                    r.get("notas", "")
+                ),
+                tags=tuple(tags)
+            )
+
+    def limpiar_formulario():
+        cb_unidad.current(0)
+        e_fecha.delete(0, "end")
+        e_fecha.insert(0, datetime.datetime.now().strftime("%d/%m/%Y"))
+        cb_estado_lavado.current(0)
+        e_tiempo.delete(0, "end")
+        e_tiempo.insert(0, "1h 30m")
+        e_operador.delete(0, "end")
+        e_operador.insert(0, OPERADOR_ACTUAL)
+        e_notas.delete(0, "end")
+        seleccion_id["indice"] = None
+        tabla.selection_remove(tabla.selection())
+        estado("Formulario de lavado listo para un nuevo registro.")
+
+    def guardar_lavado():
+        fecha = e_fecha.get().strip()
+        unidad = cb_unidad.get().strip()
+        estado_reg = cb_estado_lavado.get().strip()
+        tiempo = e_tiempo.get().strip()
+        operador = e_operador.get().strip()
+        notas = e_notas.get().strip()
+
+        if not _parse_fecha_ddmmaaaa(fecha):
+            messagebox.showerror(
+                "Fecha inválida",
+                "Ingrese la fecha del lavado en formato DD/MM/AAAA."
+            )
+            e_fecha.focus_set()
+            return
+
+        if not unidad or not estado_reg or not tiempo or not operador:
+            messagebox.showwarning(
+                "Campos incompletos",
+                "Complete unidad, fecha, estado, tiempo y operador."
+            )
+            return
+
+        if not notas:
+            notas = "Sin observaciones."
+
+        registro = {
+            "fecha": _iso_desde_ddmmaaaa(fecha), "unidad": unidad, "estado": estado_reg,
+            "tiempo": tiempo, "operador": operador, "notas": notas,
+        }
+        registro["id"] = guardar_lavado_bd(registro)
+        LAVADOS_HISTORIAL.insert(0, registro)
+
+        cargar_tabla()
+        limpiar_formulario()
+        estado(f"Lavado registrado: {unidad}")
+        messagebox.showinfo(
+            "Guardado",
+            f"El lavado de «{unidad}» fue registrado correctamente."
+        )
+
+    def seleccionar_registro(_event=None):
+        seleccion = tabla.selection()
+        if not seleccion:
+            return
+
+        registro_id = int(seleccion[0])
+        indice = next((i for i, r0 in enumerate(LAVADOS_HISTORIAL) if int(r0.get("id", -1)) == registro_id), None)
+        if indice is None:
+            return
+
+        r = LAVADOS_HISTORIAL[indice]
+        seleccion_id["indice"] = indice
+
+        try:
+            cb_unidad.set(r.get("unidad", unidades[0]))
+        except tk.TclError:
+            cb_unidad.current(0)
+
+        e_fecha.delete(0, "end")
+        e_fecha.insert(0, _fecha_para_mostrar(r.get("fecha", "")))
+
+        try:
+            cb_estado_lavado.set(r.get("estado", "Completado"))
+        except tk.TclError:
+            cb_estado_lavado.current(0)
+
+        e_tiempo.delete(0, "end")
+        e_tiempo.insert(0, r.get("tiempo", ""))
+
+        e_operador.delete(0, "end")
+        e_operador.insert(0, r.get("operador", ""))
+
+        e_notas.delete(0, "end")
+        e_notas.insert(0, r.get("notas", ""))
+
+        estado("Registro seleccionado. Puede actualizarlo o eliminarlo.")
+
+    def actualizar_lavado():
+        indice = seleccion_id["indice"]
+        if indice is None or indice >= len(LAVADOS_HISTORIAL):
+            messagebox.showwarning(
+                "Seleccione un registro",
+                "Seleccione una fila del historial antes de actualizar."
+            )
+            return
+
+        fecha = e_fecha.get().strip()
+        if not _parse_fecha_ddmmaaaa(fecha):
+            messagebox.showerror(
+                "Fecha inválida",
+                "Ingrese la fecha en formato DD/MM/AAAA."
+            )
+            return
+
+        notas = e_notas.get().strip() or "Sin observaciones."
+
+        LAVADOS_HISTORIAL[indice].update({
+            "fecha": _iso_desde_ddmmaaaa(fecha),
+            "unidad": cb_unidad.get().strip(),
+            "estado": cb_estado_lavado.get().strip(),
+            "tiempo": e_tiempo.get().strip(),
+            "operador": e_operador.get().strip(),
+            "notas": notas,
+        })
+        actualizar_lavado_bd(LAVADOS_HISTORIAL[indice]["id"], LAVADOS_HISTORIAL[indice])
+
+        cargar_tabla()
+        seleccion_id["indice"] = None
+        limpiar_formulario()
+        estado("Registro de lavado actualizado correctamente.")
+        messagebox.showinfo("Actualizado", "El registro fue actualizado.")
+
+    def eliminar_lavado():
+        indice = seleccion_id["indice"]
+        if indice is None or indice >= len(LAVADOS_HISTORIAL):
+            messagebox.showwarning(
+                "Seleccione un registro",
+                "Seleccione una fila del historial antes de eliminar."
+            )
+            return
+
+        r = LAVADOS_HISTORIAL[indice]
+        confirmar = messagebox.askyesno(
+            "Confirmar eliminación",
+            f"¿Desea eliminar el registro de «{r.get('unidad', '')}» "
+            f"del {r.get('fecha', '')}?"
+        )
+        if not confirmar:
+            return
+
+        eliminar_lavado_bd(LAVADOS_HISTORIAL[indice]["id"])
+        LAVADOS_HISTORIAL.pop(indice)
+        cargar_tabla()
+        limpiar_formulario()
+        estado("Registro eliminado.")
+
+    boton_accion(
+        botones_registro, "Guardar lavado",
+        guardar_lavado, anchor="w", side="left",
+        pady=0
+    )
+
+    boton_accion(
+        botones_registro, "Actualizar seleccionado",
+        actualizar_lavado, color=COLOR_ACENTO,
+        anchor="w", side="left", padx=(7, 0), pady=0
+    )
+
+    tk.Button(
+        botones_registro, text="Eliminar seleccionado",
+        command=eliminar_lavado,
+        bg="#b91c1c", fg="white",
+        font=FUENTE_FUERTE, relief="flat",
+        cursor="hand2", padx=12, pady=7, bd=0,
+        activebackground="#991b1b",
+        activeforeground="white"
+    ).pack(side="left", padx=(7, 0))
+
+    tk.Button(
+        botones_registro, text="Nuevo / Limpiar",
+        command=limpiar_formulario,
+        bg="#64748b", fg="white",
+        font=FUENTE_FUERTE, relief="flat",
+        cursor="hand2", padx=12, pady=7, bd=0,
+        activebackground="#475569",
+        activeforeground="white"
+    ).pack(side="left", padx=(7, 0))
+
+    tabla.bind("<<TreeviewSelect>>", seleccionar_registro)
+    e_filtro.bind("<KeyRelease>", lambda _e: cargar_tabla())
+
+    cargar_tabla()
+    estado(f"{len(LAVADOS_HISTORIAL)} registros de lavado cargados.")
+
+def abrir_horometro():
+    cuerpo = panel("Horómetro de la bomba",
+                   f"Mantenimiento programado cada {HORAS_MANTENIMIENTO:.0f} horas")
+    eh = campo(cuerpo, "LECTURA DE HORAS ACUMULADAS", "11384.4", 16)
+
+    lbl = tk.Label(cuerpo, text="Horas remanentes: —", font=("Segoe UI Semibold", 11),
+                   bg=COLOR_PANEL, fg=COLOR_ACENTO)
+    lbl.pack(anchor="w", pady=16)
+
+    barra = ttk.Progressbar(cuerpo, length=420, maximum=HORAS_MANTENIMIENTO)
+    barra.pack(anchor="w", pady=(0, 16))
+
+    def auditar():
+        try:
+            horas = a_float(eh, "Lectura de horas")
+        except ValueError as err:
+            messagebox.showerror("Dato inválido", str(err))
+            return
+        if horas < 0:
+            messagebox.showerror("Dato inválido", "La lectura no puede ser negativa.")
+            return
+        rem = HORAS_MANTENIMIENTO - horas
+        barra["value"] = min(horas, HORAS_MANTENIMIENTO)
+        if rem <= 0:
+            lbl.config(text="Mantenimiento VENCIDO. Intervenga la bomba.", fg=COLOR_ALERTA)
+        elif rem <= 500:
+            lbl.config(text=f"Horas remanentes: {rem:.1f} h — próximo a vencer", fg="#b7791f")
+        else:
+            lbl.config(text=f"Horas remanentes: {rem:.1f} h", fg=COLOR_ACENTO)
+        guardar_horometro_bd(
+            datetime.datetime.now().strftime("%Y-%m-%d"),
+            datetime.datetime.now().strftime("%H:%M"),
+            "Bomba", horas, OPERADOR_ACTUAL, "Lectura registrada desde horómetro"
+        )
+        estado(f"Auditoría de desgaste: {rem:.1f} h restantes · lectura guardada")
+
+    boton_accion(cuerpo, "Auditar desgaste y guardar", auditar, anchor="w")
+
+
+def abrir_reportes():
+    """Centro de reportes: consulta SQLite y exporta HTML, Excel y PDF."""
+    limpiar()
+    area = _contenedor_desplazable(frame_contenido)
+    cont = tk.Frame(area, bg=COLOR_FONDO)
+    cont.pack(fill="x", padx=16, pady=10)
+
+    tk.Label(cont, text="Centro de Reportes PTAR", font=("Segoe UI Semibold", 14),
+             bg=COLOR_FONDO, fg=COLOR_MARCA).pack(anchor="w")
+    tk.Label(cont, text="Consulta, exportación y consolidación de la información almacenada en SQLite",
+             font=("Segoe UI", 8), bg=COLOR_FONDO, fg=COLOR_SUAVE).pack(anchor="w", pady=(2, 8))
+
+    filtros = tk.Frame(cont, bg=COLOR_PANEL, highlightbackground=COLOR_BORDE, highlightthickness=1)
+    filtros.pack(fill="x", pady=(0, 8))
+    fb = tk.Frame(filtros, bg=COLOR_PANEL)
+    fb.pack(fill="x", padx=10, pady=8)
+    tk.Label(fb, text="DESDE", font=("Segoe UI Semibold", 8), bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(side="left")
+    e_desde = ttk.Entry(fb, width=12, font=FUENTE_BASE); e_desde.pack(side="left", padx=(5, 8))
+    e_desde.insert(0, "01/09/2026")
+    tk.Label(fb, text="HASTA", font=("Segoe UI Semibold", 8), bg=COLOR_PANEL, fg=COLOR_SUAVE).pack(side="left")
+    e_hasta = ttk.Entry(fb, width=12, font=FUENTE_BASE); e_hasta.pack(side="left", padx=(5, 12))
+    e_hasta.insert(0, datetime.datetime.now().strftime("%d/%m/%Y"))
+
+    contenido = tk.Frame(cont, bg=COLOR_FONDO)
+    contenido.pack(fill="x")
+
+    datos_cache = {"ph": [], "aforos": [], "lavados": [], "mantenimientos": [], "novedades": [], "horometros": [], "dosificaciones": []}
+
+    def periodo():
+        fi = _iso_desde_ddmmaaaa(e_desde.get())
+        ff = _iso_desde_ddmmaaaa(e_hasta.get())
+        if not fi or not ff or fi > ff:
+            messagebox.showerror("Período inválido", "Use DD/MM/AAAA y verifique que DESDE sea menor o igual que HASTA.")
+            return None
+        return fi, ff
+
+    def cargar():
+        p = periodo()
+        if not p: return False
+        fi, ff = p
+        datos_cache["ph"] = db_consultar("SELECT fecha,hora,punto,ph,temperatura,operador,observaciones FROM ph_registros WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC,hora DESC", (fi,ff))
+        datos_cache["aforos"] = db_consultar("SELECT fecha,hora,volumen_l,tiempo_s,caudal_lps,operador,observaciones FROM aforos WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC,hora DESC", (fi,ff))
+        datos_cache["lavados"] = db_consultar("SELECT fecha,unidad,estado,tiempo,operador,notas FROM lavados_unidades WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC,id DESC", (fi,ff))
+        datos_cache["mantenimientos"] = db_consultar("SELECT fecha,equipo,tipo,prioridad,descripcion,responsable,horometro,repuestos,tiempo_horas,proximo,estado FROM mantenimientos WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC,id DESC", (fi,ff))
+        datos_cache["novedades"] = db_consultar("SELECT fecha,hora,tipo,descripcion,enviado_a,estado,operador FROM novedades WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC,hora DESC", (fi,ff))
+        datos_cache["horometros"] = db_consultar("SELECT fecha,hora,equipo,lectura_h,operador,observaciones FROM horometros WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC,hora DESC", (fi,ff))
+        datos_cache["dosificaciones"] = db_consultar("SELECT fecha,hora,tanque,producto,nivel_inicial_cm,nivel_final_cm,consumo_l,operador,observaciones FROM dosificaciones WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC,hora DESC", (fi,ff))
+        return True
+
+    def render():
+        if not cargar(): return
+        for w in contenido.winfo_children(): w.destroy()
+        d = datos_cache
+        ph_in=[r for r in d["ph"] if r["punto"]=="Entrada"]
+        ph_out=[r for r in d["ph"] if r["punto"]=="Salida"]
+        ca=[r["caudal_lps"] for r in d["aforos"] if r["caudal_lps"] is not None]
+        tarjetas=[
+            ("pH ENTRADA", f"{sum(r['ph'] for r in ph_in)/len(ph_in):.2f}" if ph_in else "—", f"{len(ph_in)} registros", COLOR_MARCA),
+            ("pH SALIDA", f"{sum(r['ph'] for r in ph_out)/len(ph_out):.2f}" if ph_out else "—", f"{len(ph_out)} registros", COLOR_ACENTO),
+            ("CAUDAL PROMEDIO", f"{sum(ca)/len(ca):.2f} L/s" if ca else "—", f"{len(ca)} aforos", COLOR_OK),
+            ("LAVADOS", str(len(d["lavados"])), "registros", COLOR_ACENTO),
+            ("MANTENIMIENTOS", str(len(d["mantenimientos"])), "registros", COLOR_ALERTA),
+            ("NOVEDADES", str(len(d["novedades"])), "registros", COLOR_MARCA),
+        ]
+        k=tk.Frame(contenido,bg=COLOR_FONDO); k.pack(fill="x",pady=(0,8))
+        for title,val,sub,col in tarjetas:
+            c=tk.Frame(k,bg=COLOR_PANEL,highlightbackground=COLOR_BORDE,highlightthickness=1)
+            c.pack(side="left",fill="x",expand=True,padx=(0,6),ipady=4)
+            tk.Label(c,text=title,font=("Segoe UI",7,"bold"),bg=COLOR_PANEL,fg=COLOR_SUAVE).pack(anchor="w",padx=7)
+            tk.Label(c,text=val,font=("Segoe UI Semibold",12),bg=COLOR_PANEL,fg=col).pack(anchor="w",padx=7)
+            tk.Label(c,text=sub,font=("Segoe UI",7),bg=COLOR_PANEL,fg=COLOR_SUAVE).pack(anchor="w",padx=7)
+        tk.Label(contenido,text="Seleccione una exportación o revise las tablas del período.",font=("Segoe UI",8),bg=COLOR_FONDO,fg=COLOR_SUAVE).pack(anchor="w",pady=(0,6))
+
+        for titulo, clave, columnas in [
+            ("pH", "ph", ("fecha","hora","punto","ph","temperatura","operador","observaciones")),
+            ("Aforos", "aforos", ("fecha","hora","volumen_l","tiempo_s","caudal_lps","operador","observaciones")),
+            ("Lavado de unidades", "lavados", ("fecha","unidad","estado","tiempo","operador","notas")),
+            ("Mantenimiento", "mantenimientos", ("fecha","equipo","tipo","prioridad","descripcion","responsable","horometro","repuestos","tiempo_horas","proximo","estado")),
+            ("Novedades", "novedades", ("fecha","hora","tipo","descripcion","enviado_a","estado","operador")),
+        ]:
+            box=tk.Frame(contenido,bg=COLOR_PANEL,highlightbackground=COLOR_BORDE,highlightthickness=1); box.pack(fill="x",pady=(0,7))
+            tk.Label(box,text=f"{titulo} · {len(d[clave])} registros",font=("Segoe UI Semibold",9),bg=COLOR_PANEL,fg=COLOR_TEXTO).pack(anchor="w",padx=8,pady=(6,3))
+            marco=tk.Frame(box,bg=COLOR_PANEL); marco.pack(fill="x",padx=8,pady=(0,7))
+            cols=tuple(columnas); tv=ttk.Treeview(marco,columns=cols,show="headings",height=min(5,max(2,len(d[clave]))))
+            sy=ttk.Scrollbar(marco,orient="vertical",command=tv.yview); sx=ttk.Scrollbar(marco,orient="horizontal",command=tv.xview)
+            tv.configure(yscrollcommand=sy.set,xscrollcommand=sx.set); tv.grid(row=0,column=0,sticky="nsew"); sy.grid(row=0,column=1,sticky="ns"); sx.grid(row=1,column=0,sticky="ew")
+            marco.grid_columnconfigure(0,weight=1)
+            for col in cols:
+                tv.heading(col,text=col.upper()); tv.column(col,width=115,minwidth=75,anchor="w")
+            for r in d[clave]: tv.insert("","end",values=tuple("" if r.get(c) is None else r.get(c) for c in cols))
+
+    def exportar_html():
+        if not cargar(): return
+        ruta=filedialog.asksaveasfilename(title="Guardar informe HTML",defaultextension=".html",filetypes=[("HTML","*.html")])
+        if not ruta:return
+        p=periodo(); fi,ff=p
+        resumen=resumen_bd(fi,ff)
+        html=["<!doctype html><html><head><meta charset='utf-8'><title>Informe PTAR Bellavista</title>","<style>body{font-family:Segoe UI,Arial;margin:30px;color:#1a202c}h1{color:#0f2d59}h2{margin-top:24px;color:#2b6cb0}.k{display:inline-block;padding:12px;margin:4px;border:1px solid #d7dde7;border-radius:6px}.k b{display:block;font-size:20px}table{border-collapse:collapse;width:100%;margin:8px 0 20px}th,td{border:1px solid #d7dde7;padding:6px;font-size:11px}th{background:#0f2d59;color:white}</style></head><body>"]
+        html.append(f"<h1>PTAR BELLAVISTA · Informe operativo</h1><p>Período: {fi} a {ff}</p>")
+        for title,val in [("pH entrada", resumen['ph'][0]['promedio'] if resumen['ph'] and resumen['ph'][0]['punto']=='Entrada' else '—'),("Caudal",resumen['aforos'].get('promedio','—')),('Lavados',resumen['lavados'].get('total',0)),('Mantenimientos',resumen['mantenimientos'].get('total',0)),('Novedades',resumen['novedades'].get('total',0))]: html.append(f"<div class='k'>{title}<b>{val}</b></div>")
+        for titulo, clave in [("pH","ph"),("Aforos","aforos"),("Lavado de unidades","lavados"),("Mantenimiento","mantenimientos"),("Novedades","novedades")]:
+            rows=datos_cache[clave]
+            html.append(f"<h2>{titulo}</h2><table><tr>{''.join(f'<th>{c}</th>' for c in (rows[0].keys() if rows else []))}</tr>")
+            for r in rows: html.append("<tr>"+''.join(f"<td>{str(v).replace('&','&amp;').replace('<','&lt;')}</td>" for v in r.values())+"</tr>")
+            html.append("</table>")
+        html.append("</body></html>")
+        Path(ruta).write_text("".join(html),encoding="utf-8")
+        messagebox.showinfo("Informe generado",ruta)
+
+    def exportar_excel():
+        if not HAY_EXCEL:
+            messagebox.showwarning("Excel no disponible","Instale openpyxl: pip install openpyxl"); return
+        if not cargar(): return
+        ruta=filedialog.asksaveasfilename(title="Guardar informe Excel",defaultextension=".xlsx",filetypes=[("Excel","*.xlsx")])
+        if not ruta:return
+        wb=Workbook(); ws=wb.active; ws.title="Resumen"
+        ws.append(["PTAR BELLAVISTA","Informe operativo"]); ws.append(["Desde",e_desde.get(),"Hasta",e_hasta.get()])
+        relleno_encabezado = PatternFill(fill_type="solid", fgColor="0F2D59")
+        fuente_encabezado = Font(color="FFFFFF", bold=True)
+        relleno_ph_bajo = PatternFill(fill_type="solid", fgColor="F4CCCC")
+        fuente_ph_alerta = Font(color="9C0006", bold=True)
+        relleno_ph_alto = PatternFill(fill_type="solid", fgColor="FCE4D6")
+
+        for titulo, clave in [("pH","ph"),("Aforos","aforos"),("Lavado","lavados"),("Mantenimiento","mantenimientos"),("Novedades","novedades"),("Horómetros","horometros"),("Dosificaciones","dosificaciones")]:
+            sh=wb.create_sheet(titulo[:31]); rows=datos_cache[clave]
+            if rows:
+                encabezados=list(rows[0].keys())
+                sh.append(encabezados)
+                for r in rows:
+                    sh.append([r.get(c) for c in encabezados])
+                # Resaltar el valor pH cuando esté por fuera del rango configurado.
+                if clave == "ph" and "ph" in encabezados:
+                    col_ph = encabezados.index("ph") + 1
+                    for fila in range(2, sh.max_row + 1):
+                        celda = sh.cell(row=fila, column=col_ph)
+                        try:
+                            valor_ph = float(celda.value)
+                        except (TypeError, ValueError):
+                            continue
+                        if valor_ph < PH_MIN:
+                            celda.fill = relleno_ph_bajo
+                            celda.font = fuente_ph_alerta
+                        elif valor_ph > PH_MAX:
+                            celda.fill = relleno_ph_alto
+                            celda.font = fuente_ph_alerta
+                for celda in sh[1]:
+                    celda.fill = relleno_encabezado
+                    celda.font = fuente_encabezado
+                    celda.alignment = Alignment(vertical="center", wrap_text=True)
+                sh.auto_filter.ref = sh.dimensions
+            else:
+                sh.append(["Sin registros en el período"])
+            sh.freeze_panes="A2"
+            # Ajuste automático de ancho según el contenido, con límites para textos largos.
+            for columna in sh.columns:
+                letra = columna[0].column_letter
+                max_largo = max((len(str(c.value)) if c.value is not None else 0 for c in columna), default=0)
+                sh.column_dimensions[letra].width = min(max(max_largo + 2, 12), 55)
+            for fila in sh.iter_rows():
+                for celda in fila:
+                    celda.alignment = Alignment(vertical="top", wrap_text=True)
+        # También ajustar columnas de la hoja Resumen.
+        for columna in ws.columns:
+            letra = columna[0].column_letter
+            max_largo = max((len(str(c.value)) if c.value is not None else 0 for c in columna), default=0)
+            ws.column_dimensions[letra].width = min(max(max_largo + 2, 12), 55)
+        wb.save(ruta); messagebox.showinfo("Excel generado",ruta)
+
+    def exportar_pdf():
+        if not HAY_PDF:
+            messagebox.showwarning("PDF no disponible","Instale reportlab: pip install reportlab"); return
+        if not cargar(): return
+        ruta=filedialog.asksaveasfilename(title="Guardar informe PDF",defaultextension=".pdf",filetypes=[("PDF","*.pdf")])
+        if not ruta:return
+        styles=getSampleStyleSheet(); doc=SimpleDocTemplate(ruta,pagesize=landscape(A4),rightMargin=24,leftMargin=24,topMargin=24,bottomMargin=24)
+        story=[Paragraph("PTAR BELLAVISTA · INFORME OPERATIVO",styles["Title"]),Paragraph(f"Período: {e_desde.get()} a {e_hasta.get()}",styles["Normal"]),Spacer(1,10)]
+        for titulo, clave in [("pH","ph"),("Aforos","aforos"),("Lavado de unidades","lavados"),("Mantenimiento","mantenimientos"),("Novedades","novedades")]:
+            rows=datos_cache[clave]; story.append(Paragraph(titulo,styles["Heading2"]))
+            if rows:
+                headers=list(rows[0].keys()); data=[headers]+[[str(r.get(h,'')) for h in headers] for r in rows[:80]]
+                table=Table(data,repeatRows=1); table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),pdf_colors.HexColor('#0f2d59')),('TEXTCOLOR',(0,0),(-1,0),pdf_colors.white),('FONTSIZE',(0,0),(-1,-1),6),('GRID',(0,0),(-1,-1),0.25,pdf_colors.grey),('VALIGN',(0,0),(-1,-1),'TOP')]))
+                story.append(table)
+            else: story.append(Paragraph("Sin registros en el período.",styles["Normal"]))
+            story.append(Spacer(1,8))
+        doc.build(story); messagebox.showinfo("PDF generado",ruta)
+
+    boton_accion(fb,"Consultar",render,side="left",padx=(4,0),pady=0)
+    boton_accion(fb,"Exportar HTML",exportar_html,side="left",padx=(6,0),pady=0)
+    boton_accion(fb,"Exportar Excel",exportar_excel,side="left",padx=(6,0),pady=0)
+    boton_accion(fb,"Exportar PDF",exportar_pdf,side="left",padx=(6,0),pady=0)
+    render()
+
+
+# ==================================================== 5. VENTANA PRINCIPAL
+inicializar_base_datos()
+preparar_sincronizacion()
+# Recupera el último operador activo para asignarlo automáticamente tras reiniciar.
+try:
+    _cfg_operador = db_consultar("SELECT valor FROM configuracion WHERE clave='operador_actual'")
+    if _cfg_operador and _cfg_operador[0].get("valor", "").strip():
+        OPERADOR_ACTUAL = _cfg_operador[0]["valor"].strip()
+except Exception:
+    pass
+# Después de crear/migrar la base, todos los módulos que muestran historial
+# cargan la información persistente de SQLite. Así, lo que se guardó ayer
+# no desaparece al cerrar y volver a abrir el programa.
+try:
+    MANTENIMIENTOS_HISTORIAL = cargar_mantenimientos_bd()
+except Exception:
+    pass
+try:
+    NOVEDADES_HISTORIAL = cargar_novedades_bd()
+except Exception:
+    pass
+try:
+    LAVADOS_HISTORIAL = cargar_lavados_bd()
+except Exception:
+    pass
+
+ventana = tk.Tk()
+ventana.title("SCADA PTAR Bellavista")
+ventana.geometry("1180x700")
+ventana.minsize(1000, 620)
+ventana.configure(bg=COLOR_FONDO)
+
+estilo = ttk.Style(ventana)
+try:
+    estilo.theme_use("clam")
+except tk.TclError:
+    pass
+estilo.configure("Treeview", rowheight=28, font=FUENTE_SUB,
+                 fieldbackground=COLOR_PANEL, borderwidth=0)
+estilo.configure("Treeview.Heading", font=("Segoe UI Semibold", 9),
+                 background=COLOR_MARCA, foreground="white", relief="flat")
+estilo.map("Treeview.Heading", background=[("active", COLOR_MARCA_HOVER)])
+estilo.configure("TEntry", padding=6)
+estilo.configure("TCombobox", padding=5)
+estilo.configure("TProgressbar", troughcolor="#e2e8f0",
+                 background=COLOR_ACENTO, thickness=14)
+
+# ---- Encabezado
+encabezado = tk.Frame(ventana, bg=COLOR_MARCA, height=64)
+encabezado.pack(fill="x")
+encabezado.pack_propagate(False)
+
+tk.Label(encabezado, text="💧", font=("Segoe UI Emoji", 16),
+         bg=COLOR_MARCA, fg="white").pack(side="left", padx=(22, 6))
+tk.Label(encabezado, text="PTAR BELLAVISTA", font=("Segoe UI Semibold", 14),
+         bg=COLOR_MARCA, fg="white").pack(side="left")
+tk.Label(encabezado, text="  Consola de operación y registro diario",
+         font=FUENTE_SUB, bg=COLOR_MARCA, fg="#a9bede").pack(side="left")
+
+lbl_alarma = tk.Label(encabezado, text="  SISTEMA ESTABLE  ", font=("Segoe UI Semibold", 9),
+                      bg=COLOR_OK, fg="white", padx=6, pady=5)
+lbl_alarma.pack(side="right", padx=20)
+
+lbl_reloj = tk.Label(encabezado, text="", font=FUENTE_SUB,
+                     bg=COLOR_MARCA, fg="#a9bede")
+lbl_reloj.pack(side="right", padx=10)
+
+
+def tic():
+    lbl_reloj.config(text=datetime.datetime.now().strftime("%d/%m/%Y  %H:%M:%S"))
+    ventana.after(1000, tic)
+
+
+# ---- Cuerpo: barra lateral + contenido
+cuerpo_app = tk.Frame(ventana, bg=COLOR_FONDO)
+cuerpo_app.pack(fill="both", expand=True)
+
+ANCHO_LATERAL = 232
+
+lateral_contenedor = tk.Frame(cuerpo_app, bg="#0b2146", width=ANCHO_LATERAL)
+lateral_contenedor.pack(side="left", fill="y")
+lateral_contenedor.pack_propagate(False)
+
+lateral_canvas = tk.Canvas(lateral_contenedor, bg="#0b2146", width=ANCHO_LATERAL,
+                            highlightthickness=0, bd=0)
+lateral_scroll = ttk.Scrollbar(lateral_contenedor, orient="vertical",
+                                command=lateral_canvas.yview)
+lateral_canvas.configure(yscrollcommand=lateral_scroll.set)
+lateral_canvas.pack(side="left", fill="both", expand=True)
+# La barra solo aparece si hace falta (se muestra/oculta en _ajustar_scroll_lateral)
+
+lateral = tk.Frame(lateral_canvas, bg="#0b2146")
+_ventana_lateral = lateral_canvas.create_window((0, 0), window=lateral, anchor="nw",
+                                                 width=ANCHO_LATERAL)
+
+
+def _ajustar_scroll_lateral(_evento=None):
+    lateral_canvas.configure(scrollregion=lateral_canvas.bbox("all"))
+    visible = lateral.winfo_reqheight() > lateral_canvas.winfo_height()
+    if visible:
+        if not lateral_scroll.winfo_ismapped():
+            lateral_scroll.pack(side="right", fill="y")
+    else:
+        if lateral_scroll.winfo_ismapped():
+            lateral_scroll.pack_forget()
+
+
+lateral.bind("<Configure>", _ajustar_scroll_lateral)
+lateral_canvas.bind("<Configure>", _ajustar_scroll_lateral)
+
+
+def _rueda_lateral(evento):
+    lateral_canvas.yview_scroll(-1 if evento.delta > 0 else 1, "units")
+
+
+lateral_canvas.bind("<Enter>", lambda e: lateral_canvas.bind_all("<MouseWheel>", _rueda_lateral))
+lateral_canvas.bind("<Leave>", lambda e: lateral_canvas.unbind_all("<MouseWheel>"))
+
+# ---- Logo + título de la planta (arriba del menú)
+bloque_logo = tk.Frame(lateral, bg="#0b2146")
+bloque_logo.pack(fill="x", padx=16, pady=(18, 14))
+
+canvas_logo = tk.Canvas(bloque_logo, width=42, height=42, bg="#0b2146", highlightthickness=0)
+canvas_logo.pack(side="left")
+canvas_logo.create_oval(1, 1, 41, 41, fill="#2b6cb0", outline="#5ea3e0", width=1)
+canvas_logo.create_text(21, 21, text="💧", font=("Segoe UI Emoji", 16))
+
+texto_logo = tk.Frame(bloque_logo, bg="#0b2146")
+texto_logo.pack(side="left", padx=(10, 0))
+tk.Label(texto_logo, text="PTAR", font=("Segoe UI Semibold", 10), bg="#0b2146",
+         fg="white").pack(anchor="w")
+tk.Label(texto_logo, text="BELLAVISTA", font=("Segoe UI Semibold", 10), bg="#0b2146",
+         fg="white").pack(anchor="w")
+tk.Label(texto_logo, text="SCADA v5.1", font=("Segoe UI", 8), bg="#0b2146",
+         fg="#7fa3d1").pack(anchor="w", pady=(2, 0))
+
+tk.Frame(lateral, bg="#1c3b6b", height=1).pack(fill="x", padx=16, pady=(0, 4))
+
+frame_contenido = tk.Frame(cuerpo_app, bg=COLOR_FONDO)
+frame_contenido.pack(side="right", fill="both", expand=True)
+
+def abrir_ph_entrada():
+    abrir_analitica("Entrada")
+
+
+def abrir_ph_salida():
+    abrir_analitica("Salida")
+
+
+MENU = [
+    ("MONITOREO", None),
+    ("Dashboard",             abrir_inicio),
+    ("pH de entrada",        abrir_ph_entrada),
+    ("pH de salida",         abrir_ph_salida),
+    ("Estadísticas",         abrir_centro_analitica),
+    ("AFOROS", None),
+    ("Aforo Volumétrico",    abrir_aforo_volumetrico),
+    ("OPERACIÓN", None),
+    ("Dosificación",         abrir_dosificacion),
+    ("Lavado de unidades",   abrir_actividades),
+    ("Horómetro bomba",      abrir_horometro),
+    ("Mantenimiento",        abrir_mantenimiento),
+    ("REGISTROS", None),
+    ("Horarios de turno",    abrir_horarios),
+    ("Operador",             abrir_operador),
+    ("Novedades",            abrir_novedades),
+    ("Evidencias",           abrir_imagenes),
+    ("Planillas mensuales",  abrir_reportes),
+    ("Sincronización",        abrir_sincronizacion),
+]
+
+botones_menu = []
+MENU_BOTON = {}  # acción -> botón del menú lateral (para las tarjetas del Panel general)
+
+
+def seleccionar(btn, accion):
+    for b in botones_menu:
+        b.config(bg="#0b2146", fg="#c9d6ec")
+    btn.config(bg=COLOR_MARCA_HOVER, fg="white")
+    accion()
+
+
+for texto, accion in MENU:
+    if accion is None:
+        tk.Label(lateral, text=texto, font=("Segoe UI", 8, "bold"),
+                 bg="#0b2146", fg="#5d7cad").pack(anchor="w", padx=20, pady=(10, 2))
+        continue
+    b = tk.Button(lateral, text="   " + texto, font=("Segoe UI", 8), anchor="w",
+                  bg="#0b2146", fg="#c9d6ec", relief="flat", bd=0, cursor="hand2",
+                  activebackground=COLOR_MARCA_HOVER, activeforeground="white",
+                  padx=10, pady=5)
+    b.config(command=lambda bb=b, ac=accion: seleccionar(bb, ac))
+    b.pack(fill="x", padx=6, pady=0)
+    MENU_BOTON[accion] = b
+    b.bind("<Enter>", lambda e, bb=b: bb.config(bg="#14315f")
+           if bb.cget("fg") != "white" else None)
+    b.bind("<Leave>", lambda e, bb=b: bb.config(bg="#0b2146")
+           if bb.cget("fg") != "white" else None)
+    botones_menu.append(b)
+
+# ---- Barra de estado
+barra_estado = tk.Frame(ventana, bg="#dde3ec", height=26)
+barra_estado.pack(fill="x", side="bottom")
+barra_estado.pack_propagate(False)
+lbl_estado = tk.Label(barra_estado, text="Listo.", font=("Segoe UI", 8),
+                      bg="#dde3ec", fg=COLOR_SUAVE)
+lbl_estado.pack(side="left", padx=16)
+tk.Label(barra_estado, text="v5 · SQLite · offline · datos persistentes", font=("Segoe UI", 8),
+         bg="#dde3ec", fg=COLOR_SUAVE).pack(side="right", padx=16)
+
+# ---- Arranque
+actualizar_alarmas()
+tic()
+if botones_menu:
+    seleccionar(botones_menu[0], abrir_inicio)
+
+ventana.mainloop()
