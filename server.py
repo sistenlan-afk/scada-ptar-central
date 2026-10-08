@@ -1,15 +1,14 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import json, sqlite3
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 BASE=Path(__file__).resolve().parent
-WEB=BASE/'web'
+WEB=BASE
 DB=BASE/'SCADA_PTAR_CENTRAL.db'
-app=FastAPI(title='SCADA PTAR Bellavista - Servidor Central',version='1.0')
 
 def conn():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
@@ -23,18 +22,35 @@ def init():
         c.execute('CREATE INDEX IF NOT EXISTS idx_sync_tabla_fecha ON registros_sync(tabla,fecha_hora)')
         c.commit()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init()
+    yield
+
+app=FastAPI(
+    title='SCADA PTAR Bellavista - Servidor Central',
+    version='1.0',
+    lifespan=lifespan
+)
+
 class Payload(BaseModel):
     device_id: str|None=None
     registros: list[dict]
 
-@app.on_event('startup')
-def startup(): init()
-
 @app.get('/')
 def home(): return FileResponse(WEB/'index.html')
+
+@app.get('/styles.css')
+def css(): return FileResponse(WEB/'styles.css', media_type='text/css')
+
+@app.get('/app.js')
+def js(): return FileResponse(WEB/'app.js', media_type='application/javascript')
+
+@app.get('/manifest.json')
+def manifest(): return FileResponse(WEB/'manifest.json', media_type='application/json')
+
 @app.get('/sw.js')
 def sw(): return FileResponse(WEB/'sw.js',media_type='application/javascript',headers={'Service-Worker-Allowed':'/'})
-app.mount('/static',StaticFiles(directory=WEB),name='static')
 
 @app.get('/api/health')
 def health(): return {'ok':True,'server_time':datetime.now(timezone.utc).isoformat()}
