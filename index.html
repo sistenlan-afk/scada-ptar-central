@@ -1,17 +1,33 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#12315b">
-<title>SCADA PTAR Bellavista</title><link rel="manifest" href="/manifest.json"><link rel="stylesheet" href="/styles.css">
-</head><body>
-<header><div class="brand">💧 SCADA PTAR Bellavista</div><div id="connection" class="status">Comprobando conexión…</div></header>
-<main>
-<section class="intro"><h1>Operación de la PTAR</h1><p>Los registros se envían a la nube cuando hay internet. Sin señal, se guardan temporalmente y se sincronizan después.</p></section>
-<section class="panel"><h2>Menú de operación</h2><nav id="moduleMenu" class="module-menu" aria-label="Módulos SCADA"></nav></section>
-<section class="panel"><h2 id="formTitle">Nuevo registro</h2>
-<form id="recordForm"><input type="hidden" id="tipo">
-<div class="grid"><label>Fecha y hora<input id="fechaHora" type="datetime-local" required></label><label>Operador<input id="operador" autocomplete="name" required placeholder="Nombre y apellido"></label></div>
-<div id="dynamicFields"></div><label>Observaciones / descripción<textarea id="observaciones" rows="3" placeholder="Detalle del registro"></textarea></label>
-<button type="submit">Guardar registro</button></form></section>
-<section class="panel sync-panel"><h2>Sincronización con la nube</h2><p id="cloudSummary">Los registros sincronizados se guardan en el servidor y se eliminan de la memoria local del teléfono para ahorrar espacio.</p><div class="actions"><button id="syncBtn" type="button">Sincronizar pendientes</button></div><p id="counts">0 pendientes en este dispositivo</p><p id="syncMessage" role="status"></p></section>
-</main><footer>SCADA PTAR Bellavista · Los registros sincronizados permanecen en el servidor central.</footer><script src="/app.js"></script></body></html>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SCADA PTAR Bellavista</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root{--blue:#0f3d5e;--green:#2e7d32;--bg:#f5f7fb}
+*{box-sizing:border-box;font-family:system-ui,sans-serif}
+body{margin:0;background:var(--bg);padding-bottom:80px}
+.header{background:var(--blue);color:#fff;padding:12px 16px;display:flex;justify-content:space-between;align-items:center}
+.logo{width:40px;height:40px;border-radius:8px;background:#fff;padding:2px}
+.total-card{background:linear-gradient(135deg,#4caf50,#2e7d32);color:#fff}
+.card,.menu-card{background:#fff;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.menu-card{border-left:4px solid var(--green)}
+.form{display:flex;flex-direction:column;gap:10px}
+.form input,.form select,.form textarea{padding:12px;border:1px solid #ddd;border-radius:10px;font-size:16px;width:100%}
+.total-result{background:#e3f2fd;padding:10px;border-radius:10px;font-weight:700;text-align:center;color:var(--blue);font-size:18px}
+.btn{padding:14px;border-radius:12px;border:none;font-weight:700}
+.btn.primary{background:var(--blue);color:#fff}
+.progress{background:#e0e0e0;height:14px;border-radius:7px;overflow:hidden}.bar{height:100%;background:#7c4dff}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:#fff;display:flex;justify-content:space-around;padding:8px 0;border-top:1px solid #ddd}
+</style>
+</head>
+<body>
+<!-- TODO EL CODIGO QUE TE GENERE - CON: -->
+<!-- 1. TOTAL CAUDAL = A1+A2+A3 -->
+<!-- 2. OPERADOR AUTOMATICO PARA TODA LA PLANILLA DEL DIA -->
+<!-- 3. HORA AUTO/MANUAL -->
+<!-- 4. TANQUE 60L CON FORMULA Saldo_actual = Saldo_anterior - Consumo -->
+<!-- 5. PLANILLA MENSUAL AUTOMATICA -->
+... todo el script incluido
