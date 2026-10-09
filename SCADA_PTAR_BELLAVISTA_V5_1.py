@@ -4,7 +4,17 @@ SCADA LITE - PTAR BELLAVISTA
 Consola de operación y registro diario.
 Requiere: Python 3.10+  |  Opcional: matplotlib (para las gráficas)
 """
+import requests
+import threading
 
+def enviar_a_nube(tabla, datos_dict):
+    def _enviar():
+        try:
+            url = "https://scada-ptar-central.onrender.com/api/datos"
+            payload = {"tabla": tabla, "origen": "PC_BELLAVISTA", **datos_dict}
+            requests.post(url, json=payload, timeout=5)
+        except: pass
+    threading.Thread(target=_enviar, daemon=True).start()
 import random
 import sqlite3
 import csv
