@@ -132,8 +132,22 @@ def db_ejecutar(sql, parametros=(), commit=True):
         cur = con.execute(sql, parametros)
         if commit:
             con.commit()
+        # --- SYNC AUTOMATICO A LA NUBE (PC -> CELULAR) ---
+        try:
+            s = sql.upper()
+            if "INSERT INTO" in s:
+                if "AFOROS" in s and len(parametros) >= 5:
+                    enviar_a_nube("aforos", {"fecha": parametros[0], "hora": parametros[1], "volumen_l": parametros[2], "tiempo_s": parametros[3], "caudal_lps": parametros[4]})
+                elif "PH_REGISTROS" in s and len(parametros) >= 4:
+                    enviar_a_nube("ph_registros", {"fecha": parametros[0], "hora": parametros[1], "punto": parametros[2], "ph": parametros[3]})
+                elif "DOSIFICACIONES" in s:
+                    enviar_a_nube("dosificaciones", {"fecha": parametros[0], "datos": str(parametros)})
+                elif "NOVEDADES" in s:
+                    enviar_a_nube("novedades", {"fecha": parametros[0], "texto": str(parametros)})
+                elif "HOROMETROS" in s:
+                    enviar_a_nube("horometros", {"fecha": parametros[0], "datos": str(parametros)})
+        except: pass
         return cur.lastrowid
-
 
 def db_consultar(sql, parametros=()):
     with db_conexion() as con:
