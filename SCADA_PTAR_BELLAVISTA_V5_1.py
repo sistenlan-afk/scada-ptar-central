@@ -16,6 +16,7 @@ import urllib.request
 import json
 import uuid
 import time
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
@@ -91,7 +92,8 @@ for d in range(1, 15):
 # ==================================================== 3. BASE DE DATOS LOCAL
 # La base queda junto al programa para que la PTAR conserve sus registros
 # aunque la aplicación se cierre. No requiere internet ni un servidor externo.
-RUTA_BASE_DATOS = Path(__file__).resolve().parent / "SCADA_PTAR_BELLAVISTA.db"
+BASE_APLICACION = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+RUTA_BASE_DATOS = BASE_APLICACION / "SCADA_PTAR_BELLAVISTA.db"
 
 
 def db_conexion():
@@ -319,6 +321,65 @@ def sincronizar_con_servidor(url=None, timeout=8):
     return resultado
 
 
+def descargar_desde_servidor(url=None, timeout=10, limit=2000):
+    """Descarga registros centralizados nuevos y los incorpora a SQLite local sin duplicarlos."""
+    base = (url or obtener_config("sync_server_url", "https://scada-ptar-central.onrender.com")).strip().rstrip("/")
+    guardar_config("sync_server_url", base)
+    req = urllib.request.Request(f"{base}/api/registros?limit={int(limit)}", method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    registros = data.get("registros", [])
+    mapa = {
+        "ph_entrada": "ph_registros", "ph_salida": "ph_registros",
+        "aforo": "aforos", "lavado": "lavados_unidades", "novedad": "novedades",
+        "dosificacion": "dosificaciones", "mantenimiento": "mantenimientos",
+        "horometro": "horometros", "actividad": "actividades",
+        "dosificacion": "dosificaciones", "mantenimiento": "mantenimientos",
+        "horarios": "actividades", "operador": "actividades",
+        "evidencias": "novedades", "dashboard": "actividades",
+        "estadisticas": "actividades", "planillas": "actividades",
+        "sincronizacion": "actividades"
+    }
+    insertados = 0
+    for r in registros:
+        uid = str(r.get("sync_uuid") or "").strip()
+        tabla_origen = str(r.get("tabla") or "")
+        tabla = mapa.get(tabla_origen, tabla_origen if tabla_origen in TABLAS_SINCRONIZABLES else "")
+        datos = r.get("datos") if isinstance(r.get("datos"), dict) else {}
+        if not uid or not tabla:
+            continue
+        if db_consultar(f"SELECT id FROM {tabla} WHERE sync_uuid=?", (uid,)):
+            continue
+        d = dict(datos)
+        d.pop("id", None); d.pop("sync_uuid", None); d.pop("sync_estado", None); d.pop("creado_en", None)
+        if tabla == "ph_registros":
+            d.setdefault("fecha", r.get("fecha_hora", "")[:10])
+            d.setdefault("hora", r.get("fecha_hora", "")[11:19])
+            d.setdefault("punto", "Entrada" if tabla_origen == "ph_entrada" else "Salida")
+            if "temperatura_c" in d and "temperatura" not in d: d["temperatura"] = d.pop("temperatura_c")
+            d.setdefault("operador", r.get("operador", ""))
+        elif tabla == "aforos":
+            d.setdefault("fecha", r.get("fecha_hora", "")[:10]); d.setdefault("hora", r.get("fecha_hora", "")[11:19])
+            if "caudal_lps" not in d and d.get("volumen_l") is not None and d.get("tiempo_s"):
+                try: d["caudal_lps"] = float(d["volumen_l"]) / float(d["tiempo_s"])
+                except Exception: pass
+            d.setdefault("operador", r.get("operador", ""))
+        elif tabla == "lavados_unidades":
+            d.setdefault("fecha", r.get("fecha_hora", "")[:10]); d.setdefault("operador", r.get("operador", "")); d.setdefault("notas", d.get("observaciones", ""))
+        elif tabla == "novedades":
+            d.setdefault("fecha", r.get("fecha_hora", "")[:10]); d.setdefault("hora", r.get("fecha_hora", "")[11:19]); d.setdefault("tipo", d.get("categoria", "Novedad")); d.setdefault("descripcion", d.get("observaciones", "")); d.setdefault("enviado_a", ""); d.setdefault("estado", d.get("prioridad", "Pendiente")); d.setdefault("operador", r.get("operador", ""))
+        else:
+            d.setdefault("fecha", r.get("fecha_hora", "")[:10]); d.setdefault("operador", r.get("operador", ""))
+        columnas = {x[1] for x in db_conexion().execute(f"PRAGMA table_info({tabla})").fetchall()}
+        d = {k:v for k,v in d.items() if k in columnas and k not in {"id","sync_uuid","sync_estado","creado_en"}}
+        if "fecha" not in d: continue
+        cols=list(d.keys())+['sync_uuid','sync_estado']; vals=list(d.values())+[uid,'sincronizado']
+        marks=','.join('?' for _ in cols)
+        db_ejecutar(f"INSERT INTO {tabla} ({','.join(cols)}) VALUES ({marks})", tuple(vals))
+        insertados += 1
+    return {"ok": True, "recibidos": len(registros), "insertados": insertados}
+
+
 def contar_pendientes_sync():
     try:
         preparar_sincronizacion()
@@ -379,9 +440,24 @@ def abrir_sincronizacion():
             estado_var.set("No fue posible sincronizar. Los registros permanecen en este equipo.")
             messagebox.showwarning("Sin sincronizar", f"No se enviaron los registros.\n\n{exc}\n\nTus datos locales no se borraron.")
 
+    def descargar():
+        url = e_url.get().strip().rstrip("/")
+        guardar_config("sync_server_url", url)
+        try:
+            estado_var.set("Descargando registros centralizados...")
+            ventana.update_idletasks()
+            r = descargar_desde_servidor(url)
+            estado_var.set(f"Descarga terminada. {r.get('insertados', 0)} registros nuevos.")
+            actualizar()
+            messagebox.showinfo("Datos centralizados", f"Se revisaron {r.get('recibidos', 0)} registros.\nNuevos incorporados a este equipo: {r.get('insertados', 0)}")
+        except Exception as exc:
+            estado_var.set("No se pudieron descargar datos. Los datos locales siguen disponibles.")
+            messagebox.showwarning("Sin descarga", f"No se pudieron descargar los registros.\n\n{exc}")
+
     fb = tk.Frame(card, bg=COLOR_PANEL); fb.pack(fill="x", padx=16, pady=(0,16))
     boton_accion(fb, "Probar conexión", probar, side="left", padx=(0,8))
     boton_accion(fb, "Sincronizar pendientes", sincronizar, side="left", padx=(0,8))
+    boton_accion(fb, "Descargar central", descargar, side="left", padx=(0,8))
     boton_accion(fb, "Actualizar", actualizar, side="left")
     actualizar()
 
@@ -3478,7 +3554,7 @@ barra_estado.pack_propagate(False)
 lbl_estado = tk.Label(barra_estado, text="Listo.", font=("Segoe UI", 8),
                       bg="#dde3ec", fg=COLOR_SUAVE)
 lbl_estado.pack(side="left", padx=16)
-tk.Label(barra_estado, text="v5 · SQLite · offline · datos persistentes", font=("Segoe UI", 8),
+tk.Label(barra_estado, text="v5.1 · SQLite · offline · sincronización bidireccional", font=("Segoe UI", 8),
          bg="#dde3ec", fg=COLOR_SUAVE).pack(side="right", padx=16)
 
 # ---- Arranque
