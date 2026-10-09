@@ -21,6 +21,20 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 
+import requests
+import threading
+
+def enviar_a_nube(tabla, datos_dict):
+    def _enviar():
+        try:
+            url = "https://scada-ptar-central.onrender.com/api/datos"
+            payload = {"tabla": tabla, "origen": "PC_BELLAVISTA", **datos_dict}
+            requests.post(url, json=payload, timeout=5)
+            print(f"[NUBE] {tabla} -> sincronizado")
+        except Exception as e:
+            print(f"[NUBE] Error: {e}")
+    threading.Thread(target=_enviar, daemon=True).start()
+
 # ---------------------------------------------------------------- matplotlib
 # Opcional: si no está instalado, la app sigue funcionando sin gráficas.
 try:
