@@ -1,5 +1,5 @@
-const CACHE = "scada-ptar-v1";
-const ASSETS = ["/", "/static/styles.css", "/static/app.js", "/static/manifest.json"];
+const CACHE = "scada-ptar-v2-menu-cloud";
+const ASSETS = ["/", "/static/styles.css", "/static/app.js", "/static/manifest.json", "/styles.css", "/app.js", "/manifest.json"];
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(ASSETS)));
   self.skipWaiting();

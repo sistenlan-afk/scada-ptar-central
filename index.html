@@ -1,60 +1,17 @@
 <!doctype html>
 <html lang="es">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#12315b">
-  <title>SCADA PTAR Bellavista</title>
-  <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-<header>
-  <div class="brand">💧 SCADA PTAR Bellavista</div>
-  <div id="connection" class="status">Comprobando conexión…</div>
-</header>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#12315b">
+<title>SCADA PTAR Bellavista</title><link rel="manifest" href="/manifest.json"><link rel="stylesheet" href="/styles.css">
+</head><body>
+<header><div class="brand">💧 SCADA PTAR Bellavista</div><div id="connection" class="status">Comprobando conexión…</div></header>
 <main>
-  <section class="intro">
-    <h1>Registro de operación</h1>
-    <p>Los registros se guardan primero en este dispositivo. Cuando haya conexión, pulsa <b>Sincronizar</b>.</p>
-  </section>
-
-  <section class="panel">
-    <h2>Nuevo registro</h2>
-    <form id="recordForm">
-      <label>Tipo de registro
-        <select id="tipo" required>
-          <option value="ph_entrada">pH de entrada</option>
-          <option value="ph_salida">pH de salida</option>
-          <option value="aforo">Aforo volumétrico</option>
-          <option value="lavado">Lavado de unidades</option>
-          <option value="novedad">Novedad</option>
-        </select>
-      </label>
-      <div class="grid">
-        <label>Fecha y hora <input id="fechaHora" type="datetime-local" required></label>
-        <label>Operador <input id="operador" autocomplete="name" required placeholder="Nombre y apellido"></label>
-      </div>
-      <div id="dynamicFields"></div>
-      <label>Observaciones / notas <textarea id="observaciones" rows="3" placeholder="Detalle adicional"></textarea></label>
-      <button type="submit">Guardar en este dispositivo</button>
-    </form>
-  </section>
-
-  <section class="panel">
-    <div class="list-heading">
-      <h2>Registros locales</h2>
-      <span id="counts">0 pendientes · 0 sincronizados</span>
-    </div>
-    <div class="actions">
-      <button id="syncBtn" type="button">Sincronizar pendientes</button>
-      <button id="refreshBtn" type="button" class="secondary">Actualizar lista</button>
-    </div>
-    <p id="syncMessage" role="status"></p>
-    <div id="records" class="records"></div>
-  </section>
-</main>
-<footer>SCADA PTAR Bellavista · Modo de captura local</footer>
-<script src="/app.js"></script>
-</body>
-</html>
+<section class="intro"><h1>Operación de la PTAR</h1><p>Los registros se envían a la nube cuando hay internet. Sin señal, se guardan temporalmente y se sincronizan después.</p></section>
+<section class="panel"><h2>Menú de operación</h2><nav id="moduleMenu" class="module-menu" aria-label="Módulos SCADA"></nav></section>
+<section class="panel"><h2 id="formTitle">Nuevo registro</h2>
+<form id="recordForm"><input type="hidden" id="tipo">
+<div class="grid"><label>Fecha y hora<input id="fechaHora" type="datetime-local" required></label><label>Operador<input id="operador" autocomplete="name" required placeholder="Nombre y apellido"></label></div>
+<div id="dynamicFields"></div><label>Observaciones / descripción<textarea id="observaciones" rows="3" placeholder="Detalle del registro"></textarea></label>
+<button type="submit">Guardar registro</button></form></section>
+<section class="panel sync-panel"><h2>Sincronización con la nube</h2><p id="cloudSummary">Los registros sincronizados se guardan en el servidor y se eliminan de la memoria local del teléfono para ahorrar espacio.</p><div class="actions"><button id="syncBtn" type="button">Sincronizar pendientes</button></div><p id="counts">0 pendientes en este dispositivo</p><p id="syncMessage" role="status"></p></section>
+</main><footer>SCADA PTAR Bellavista · Los registros sincronizados permanecen en el servidor central.</footer><script src="/app.js"></script></body></html>
